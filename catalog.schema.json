@@ -1,0 +1,244 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "owrt-forge 插件目录 catalog.json",
+  "type": "object",
+  "required": [
+    "schema",
+    "categories",
+    "sources",
+    "plugins"
+  ],
+  "properties": {
+    "schema": {
+      "const": 1,
+      "description": "格式版本，不兼容变更时递增"
+    },
+    "updated": {
+      "type": "string",
+      "description": "最近一次内容变化的日期 YYYY-MM-DD"
+    },
+    "upstream": {
+      "type": "object",
+      "properties": {
+        "repo": {
+          "type": "string"
+        },
+        "branch": {
+          "type": "string"
+        },
+        "commit": {
+          "type": "string"
+        }
+      }
+    },
+    "categories": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "order"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "分类名，同时是 plugins[].cat 的取值"
+          },
+          "order": {
+            "type": "integer",
+            "description": "显示顺序，小的在前"
+          },
+          "keywords": {
+            "type": "string",
+            "description": "搜索别名，空格分隔，让中文关键词也能搜到该分类"
+          }
+        }
+      }
+    },
+    "sources": {
+      "type": "array",
+      "description": "可选的源码项目；平台和机型不在这里维护，由 Worker 运行时从该仓库的 target/linux 实时读取",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "repo_url",
+          "branch"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9._-]*$",
+            "description": "项目 id，用作缓存键，只能包含小写字母、数字、点、下划线、连字符"
+          },
+          "name": {
+            "type": "string"
+          },
+          "repo_url": {
+            "type": "string",
+            "pattern": "^https://"
+          },
+          "branch": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "plugins": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "cat",
+          "kind",
+          "origin"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_.+-]+$",
+            "description": "OpenWrt 包名，唯一，会写入 CONFIG_PACKAGE_<id>=y"
+          },
+          "name": {
+            "type": "string",
+            "description": "显示名（优先中文）"
+          },
+          "desc": {
+            "type": "string",
+            "description": "中文说明；未翻译时与 desc_en 相同"
+          },
+          "desc_en": {
+            "type": "string",
+            "description": "上游 Makefile 的 LUCI_TITLE 原文"
+          },
+          "cat": {
+            "type": "string",
+            "description": "必须是 categories[].id 之一"
+          },
+          "kind": {
+            "enum": [
+              "app",
+              "theme",
+              "proto"
+            ]
+          },
+          "origin": {
+            "description": "插件源码从哪里来",
+            "oneOf": [
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "const": "builtin"
+                  }
+                },
+                "description": "已在所选源码的 feeds 里，只需选中"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type",
+                  "name",
+                  "url"
+                ],
+                "properties": {
+                  "type": {
+                    "const": "git"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "url": {
+                    "type": "string",
+                    "pattern": "^https://"
+                  },
+                  "branch": {
+                    "type": "string"
+                  },
+                  "sparse": {
+                    "type": "boolean"
+                  },
+                  "dirs": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "description": "克隆到 package/；sparse 为 true 时只取 dirs 里的目录"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type",
+                  "name",
+                  "line"
+                ],
+                "properties": {
+                  "type": {
+                    "const": "feed"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "line": {
+                    "type": "string",
+                    "description": "完整的 feeds.conf 行，如 src-git istore https://github.com/linkease/istore;main"
+                  }
+                },
+                "description": "追加一个 feed 并更新"
+              }
+            ]
+          },
+          "deps": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "上游声明的依赖，仅展示，由编译系统自动解决"
+          },
+          "requires": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "选中该插件时必须额外选中的包（如 luci-compat）"
+          },
+          "size_mb": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "minimum": 0,
+            "description": "安装体积估算，未知填 null"
+          },
+          "rec": {
+            "type": "boolean",
+            "description": "是否标记为推荐内置"
+          },
+          "tut": {
+            "type": "string",
+            "description": "使用提示，可为空"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "该插件专属的搜索关键词"
+          },
+          "hidden": {
+            "type": "boolean",
+            "description": "为 true 时商店不显示，但保留记录"
+          }
+        }
+      }
+    }
+  }
+}

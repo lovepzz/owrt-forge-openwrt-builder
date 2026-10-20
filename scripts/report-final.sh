@@ -1,27 +1,18 @@
 #!/usr/bin/env bash
-# 用途：无论成功失败都执行的最终上报（对应 workflow 里 if: always()）。
-#
-# 依赖环境变量：
-#   WORKER_URL, REPORT_TOKEN, BUILD_ID
-#   JOB_STATUS       - 传入 ${{ job.status }}
-#   GITHUB_REPOSITORY
+# 修复：cancelled 不再被改写成 failed；失败时回传日志关键行，页面可直接展示原因。
 set -euo pipefail
-
-: "${WORKER_URL:?WORKER_URL 未设置}"
-: "${REPORT_TOKEN:?REPORT_TOKEN 未设置}"
-: "${BUILD_ID:?BUILD_ID 未设置}"
-: "${JOB_STATUS:?JOB_STATUS 未设置}"
-: "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY 未设置}"
-
-if [ "$JOB_STATUS" = "success" ]; then
-  STATUS="success"
-  DOWNLOAD_URL="https://github.com/${GITHUB_REPOSITORY}/releases/tag/build-${BUILD_ID}"
-else
-  STATUS="failed"
-  DOWNLOAD_URL=""
-fi
-
-curl -sf -X POST "$WORKER_URL/api/report" \
-  -H "X-Report-Token: $REPORT_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "{\"build_id\":\"${BUILD_ID}\",\"status\":\"${STATUS}\",\"download_url\":\"${DOWNLOAD_URL}\"}"
+: "${WORKER_URL:?}"; : "${REPORT_TOKEN:?}"; : "${BUILD_ID:?}"; : "${JOB_STATUS:?}"; : "${GITHUB_REPOSITORY:?}"
+URL=""; TAIL=""
+case "$JOB_STATUS" in
+  success)   STATUS=success; URL="https://github.com/${GITHUB_REPOSITORY}/releases/tag/build-${BUILD_ID}" ;;
+  cancelled) STATUS=cancelled ;;
+  *)         STATUS=failed
+             [ -f /tmp/make.log ] && TAIL=$(grep -E "error:|Error [0-9]+|\*\*\*|missing dependencies|No space left" /tmp/make.log | tail -n 30 || true) ;;
+esac
+[ -s /tmp/config-error ] && TAIL="$(cat /tmp/config-error)
+$TAIL"
+[ -s /tmp/missing-packages ] && TAIL="未生效的插件（依赖缺失或源码里不存在）：$(tr '\n' ' ' </tmp/missing-packages)
+$TAIL"
+jq -n --arg b "$BUILD_ID" --arg s "$STATUS" --arg u "$URL" --arg t "$TAIL" \
+  '{build_id:$b,status:$s,download_url:$u,log_tail:$t}' | curl -sf -X POST "$WORKER_URL/api/report" \
+  -H "X-Report-Token: $REPORT_TOKEN" -H "Content-Type: application/json" --data-binary @-

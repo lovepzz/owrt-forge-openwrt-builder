@@ -1,38 +1,36 @@
 #!/usr/bin/env bash
-# 用途：根据 config.json 里的 plugins 列表克隆插件源码到 openwrt/package。
-# 支持 HTTPS 公共库和 SSH 私有库。
-# 支持稀疏克隆（sparse: true 时只拉取指定子目录）。
-#
-# 用法：在仓库根目录下执行，config.json 与 openwrt/ 均位于当前目录。
 set -euo pipefail
-
-# --- 新增配置：指定 Git 使用 SSH 私钥 ---
 export GIT_SSH_COMMAND="ssh -i ~/.ssh/id_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=no"
-# ---------------------------------------
-
-function git_sparse_clone() {
-  branch="$1" repourl="$2" && shift 2
-  git clone --depth=1 -b "$branch" --single-branch \
-    --filter=blob:none --sparse "$repourl"
-  repodir=$(basename "$repourl")
-  cd "$repodir" && git sparse-checkout set "$@"
-  mv -f "$@" ../package/
-  cd .. && rm -rf "$repodir"
-}
-
-mkdir -p openwrt/package
-cd openwrt
-
-jq -c '.plugins[]' ../config.json | while read -r p; do
-  url=$(echo "$p" | jq -r .git_url)
-  
-  if [ "$(echo "$p" | jq -r .sparse)" = "true" ]; then
-    # 稀疏克隆逻辑
-    dirs=$(echo "$p" | jq -r '.dirs[]' | tr '\n' ' ')
-    git_sparse_clone "$(echo "$p" | jq -r .branch)" "$url" $dirs
+ROOT="$PWD"; mkdir -p openwrt/package
+NAME_RE='^[A-Za-z0-9_.+-]+$'
+URL_RE='^(https://[A-Za-z0-9.-]+(:[0-9]+)?/[A-Za-z0-9._~/%+@-]+|git@[A-Za-z0-9.-]+:[A-Za-z0-9._~/+-]+)$'
+DIR_RE='^[A-Za-z0-9._+/-]+$'
+jq -c '.plugins[]?' config.json | while read -r p; do
+  name=$(jq -r .name <<<"$p")
+  [[ "$name" =~ $NAME_RE ]] || { echo "::error::插件目录名非法: $name"; exit 1; }
+  # feed 类插件（如 iStore）：追加到 feeds.conf.default 并单独更新，之后由 feeds install -a 安装
+  feed=$(jq -r '.feed // empty' <<<"$p")
+  if [ -n "$feed" ]; then
+    [[ "$feed" =~ ^src-(git|git-full|link)\ [A-Za-z0-9_.-]+\ https://[^[:space:]]+$ ]] || { echo "::error::feed 行格式非法: $feed"; exit 1; }
+    echo "$feed" >> "$ROOT/openwrt/feeds.conf.default"
+    (cd "$ROOT/openwrt" && ./scripts/feeds update "$name")
+    continue
+  fi
+  url=$(jq -r .git_url <<<"$p"); branch=$(jq -r '.branch // ""' <<<"$p")
+  [[ "$url" =~ $URL_RE ]] || { echo "::error::插件仓库地址非法: $url"; exit 1; }
+  # 分支可为空（使用仓库默认分支）；整仓克隆和稀疏克隆都会用到
+  bopt=(); [ -n "$branch" ] && bopt=(-b "$branch")
+  if [ "$(jq -r '.sparse // false' <<<"$p")" = "true" ]; then
+    # 修复：url 以 .git 结尾时 basename 与 git clone 生成的目录名不一致，原脚本会 cd 失败
+    tmp=$(mktemp -d); mapfile -t dirs < <(jq -r '.dirs[]' <<<"$p")
+    for d in "${dirs[@]}"; do [[ "$d" =~ $DIR_RE && "$d" != /* && "$d" != *..* ]] || { echo "::error::子目录非法: $d"; exit 1; }; done
+    git clone --depth=1 "${bopt[@]}" --single-branch --filter=blob:none --sparse -- "$url" "$tmp/r"
+    git -C "$tmp/r" sparse-checkout set "${dirs[@]}"
+    # 同名的源码自带包会被这里的版本替换（直接 mv 到已存在的目录里会变成嵌套目录）
+    for d in "${dirs[@]}"; do rm -rf "$ROOT/openwrt/package/$(basename "$d")"; mv -f "$tmp/r/$d" "$ROOT/openwrt/package/$(basename "$d")"; done
+    rm -rf "$tmp"
   else
-    # 完整克隆逻辑（支持私有库）
-    name=$(echo "$p" | jq -r .name)
-    git clone --depth 1 "$url" "package/$name"
+    rm -rf "$ROOT/openwrt/package/$name"
+    git clone --depth 1 "${bopt[@]}" -- "$url" "$ROOT/openwrt/package/$name"
   fi
 done

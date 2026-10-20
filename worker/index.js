@@ -305,12 +305,15 @@ function json(data, status = 200, extraHeaders = {}) {
       ...row,
       plugins: safeJsonParse(row.plugins, []),
       schedule_enabled: !!row.schedule_enabled,
+      packages: safeJsonParse(row.packages, []),
+      selection: safeJsonParse(row.selection, []),
+      menuconfig: !!row.menuconfig,
     };
   }
   
   async function handleListTemplates(request, env) {
     const { results } = await env.DB.prepare(
-      `SELECT id, name, repo_url, branch, target, plugins, dotconfig_version_id, schedule_cron, schedule_enabled, schedule_dotconfig_version_id, created_at, updated_at FROM templates ORDER BY updated_at DESC`
+      `SELECT id, name, repo_url, branch, target, plugins, profile, packages, selection, project_id, menuconfig, pin_dotconfig_version_id, dotconfig_version_id, schedule_cron, schedule_enabled, schedule_dotconfig_version_id, created_at, updated_at FROM templates ORDER BY updated_at DESC`
     ).all();
     return json({ templates: results.map(serializeTemplate) });
   }
@@ -321,66 +324,123 @@ function json(data, status = 200, extraHeaders = {}) {
     return json({ template: serializeTemplate(row) });
   }
   
+  // ---------- 第三方插件 / 选择清单校验：这些内容最终会被 git clone 和写进 .config ----------
+  const GIT_URL_RE = /^(https:\/\/[A-Za-z0-9.-]+(:\d+)?\/[A-Za-z0-9._~\/%+@-]+|git@[A-Za-z0-9.-]+:[A-Za-z0-9._~\/+-]+)$/;
+  const GIT_DIR_RE = /^(?!\/)(?!.*\.\.)[A-Za-z0-9._+\/-]+$/;
+  const FEED_LINE_RE = /^src-(git|git-full|link) [A-Za-z0-9_.-]+ https:\/\/\S+$/;
+  function sanitizePlugins(list) {
+    if (!Array.isArray(list)) return { error: 'plugins 必须是数组' };
+    if (list.length > 60) return { error: '第三方插件最多 60 项' };
+    const out = [];
+    for (const p of list) {
+      if (!p || typeof p !== 'object') return { error: 'plugins 里有无效项' };
+      const name = String(p.name || '');
+      if (!PKG_RE.test(name)) return { error: `插件目录名非法：${name.slice(0, 60)}` };
+      if (p.feed) {
+        if (!FEED_LINE_RE.test(String(p.feed))) return { error: `feed 行格式非法：${name}` };
+        out.push({ name, feed: String(p.feed) });
+        continue;
+      }
+      const git_url = String(p.git_url || '');
+      if (git_url.length > 300 || !GIT_URL_RE.test(git_url)) return { error: `插件仓库地址非法（仅支持 https 或 git@ 地址）：${git_url.slice(0, 80)}` };
+      const branch = String(p.branch || '');
+      if (branch && (!BRANCH_RE.test(branch) || branch.length > 100)) return { error: `插件分支名非法：${name}` };
+      const item = { name, git_url };
+      if (branch) item.branch = branch;
+      if (p.sparse) {
+        const dirs = Array.isArray(p.dirs) ? p.dirs.map(String) : [];
+        if (!dirs.length || dirs.length > 30 || dirs.some((d) => d.length > 200 || !GIT_DIR_RE.test(d))) return { error: `插件子目录非法：${name}` };
+        item.sparse = true;
+        item.dirs = dirs;
+      } else {
+        item.sparse = false;
+      }
+      out.push(item);
+    }
+    return { plugins: out };
+  }
+  function sanitizeIds(list, max) {
+    const out = [];
+    if (!Array.isArray(list)) return out;
+    for (const x of list) if (typeof x === 'string' && PKG_RE.test(x) && !out.includes(x)) out.push(x);
+    return out.slice(0, max);
+  }
+
   async function handleCreateTemplate(request, env) {
     const body = await request.json().catch(() => null);
     if (!body || !body.name || !body.repo_url || !body.branch || !body.target) {
       return err('缺少必填字段：name / repo_url / branch / target');
     }
+    const sp = sanitizePlugins(body.plugins === undefined ? [] : body.plugins);
+    if (sp.error) return err(sp.error);
     const id = uuid();
     const ts = now();
-    const plugins = JSON.stringify(Array.isArray(body.plugins) ? body.plugins : []);
-  
+    const profile = (body.profile && PKG_RE.test(body.profile)) ? body.profile : null;
+    const projectId = (body.project_id && PROJECT_ID_RE.test(body.project_id)) ? body.project_id : null;
+
     await env.DB.prepare(
       `INSERT INTO templates (id, name, repo_url, branch, target, plugins, diy_script_1, diy_script_2, dotconfig_version_id, schedule_cron, schedule_enabled, schedule_dotconfig_version_id, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
     )
-      .bind(
-        id,
-        body.name,
-        body.repo_url,
-        body.branch,
-        body.target,
-        plugins,
-        body.diy_script_1 || '',
-        body.diy_script_2 || '',
-        null,
-        body.schedule_cron || null,
-        0,
-        null,
-        ts,
-        ts
-      )
+      .bind(id, String(body.name).trim().slice(0, 80), body.repo_url, body.branch, body.target, JSON.stringify(sp.plugins),
+        body.diy_script_1 || '', body.diy_script_2 || '', null, body.schedule_cron || null, 0, null, ts, ts)
       .run();
-  
+
+    await env.DB.prepare('UPDATE templates SET packages=?, profile=?, selection=?, project_id=?, menuconfig=? WHERE id=?')
+      .bind(JSON.stringify(sanitizeIds(body.packages, 800)), profile, JSON.stringify(sanitizeIds(body.selection, 400)), projectId, body.menuconfig ? 1 : 0, id).run();
     const row = await env.DB.prepare('SELECT * FROM templates WHERE id = ?').bind(id).first();
     return json({ template: serializeTemplate(row) }, 201);
   }
-  
+
   async function handleUpdateTemplate(request, env, id) {
     const existing = await env.DB.prepare('SELECT * FROM templates WHERE id = ?').bind(id).first();
     if (!existing) return err('模板不存在', 404);
-  
+
     const body = await request.json().catch(() => null);
     if (!body) return err('请求体格式错误');
-  
-    const name = body.name ?? existing.name;
+
+    const name = body.name !== undefined ? String(body.name).trim().slice(0, 80) : existing.name;
+    if (!name) return err('模板名称不能为空');
     const repo_url = body.repo_url ?? existing.repo_url;
     const branch = body.branch ?? existing.branch;
     const target = body.target ?? existing.target;
-    const plugins = body.plugins !== undefined ? JSON.stringify(body.plugins) : existing.plugins;
+    let plugins = existing.plugins;
+    if (body.plugins !== undefined) {
+      const sp = sanitizePlugins(body.plugins);
+      if (sp.error) return err(sp.error);
+      plugins = JSON.stringify(sp.plugins);
+    }
     const diy_script_1 = body.diy_script_1 !== undefined ? body.diy_script_1 : existing.diy_script_1;
     const diy_script_2 = body.diy_script_2 !== undefined ? body.diy_script_2 : existing.diy_script_2;
-  
-    const ts = now();
+    const packages = body.packages !== undefined ? JSON.stringify(sanitizeIds(body.packages, 800)) : (existing.packages || '[]');
+    const selection = body.selection !== undefined ? JSON.stringify(sanitizeIds(body.selection, 400)) : (existing.selection || '[]');
+    const profile = body.profile !== undefined ? ((body.profile && PKG_RE.test(body.profile)) ? body.profile : null) : (existing.profile || null);
+    const projectId = body.project_id !== undefined ? ((body.project_id && PROJECT_ID_RE.test(body.project_id)) ? body.project_id : null) : (existing.project_id || null);
+    const menuconfig = body.menuconfig !== undefined ? (body.menuconfig ? 1 : 0) : (existing.menuconfig ? 1 : 0);
+
+    // 配置底稿：null = 不固定（每次按清单重新生成）；填版本 id = 固定为该版本。手动编译和定时编译共用这一个设置
+    let pin = existing.pin_dotconfig_version_id || null;
+    let schedVersion = existing.schedule_dotconfig_version_id || null;
+    if (body.pin_dotconfig_version_id !== undefined) {
+      if (body.pin_dotconfig_version_id) {
+        const v = await env.DB.prepare('SELECT id FROM dotconfig_history WHERE id = ? AND template_id = ?').bind(body.pin_dotconfig_version_id, id).first();
+        if (!v) return err('指定的 .config 版本不存在', 404);
+        pin = v.id;
+      } else {
+        pin = null;
+      }
+      schedVersion = pin;
+    }
+
     await env.DB.prepare(
-      `UPDATE templates SET name=?, repo_url=?, branch=?, target=?, plugins=?, diy_script_1=?, diy_script_2=?, updated_at=? WHERE id=?`
+      `UPDATE templates SET name=?, repo_url=?, branch=?, target=?, plugins=?, diy_script_1=?, diy_script_2=?, packages=?, selection=?, profile=?, project_id=?, menuconfig=?, pin_dotconfig_version_id=?, schedule_dotconfig_version_id=?, updated_at=? WHERE id=?`
     )
-      .bind(name, repo_url, branch, target, plugins, diy_script_1, diy_script_2, ts, id)
+      .bind(name, repo_url, branch, target, plugins, diy_script_1, diy_script_2, packages, selection, profile, projectId, menuconfig, pin, schedVersion, now(), id)
       .run();
-  
+
     const row = await env.DB.prepare('SELECT * FROM templates WHERE id = ?').bind(id).first();
     return json({ template: serializeTemplate(row) });
   }
-  
+
   async function handleDeleteTemplate(request, env, id) {
     const existing = await env.DB.prepare('SELECT id FROM templates WHERE id = ?').bind(id).first();
     if (!existing) return err('模板不存在', 404);
@@ -430,9 +490,10 @@ function json(data, status = 200, extraHeaders = {}) {
       `DELETE FROM dotconfig_history WHERE template_id = ? AND id NOT IN (
         SELECT id FROM dotconfig_history WHERE template_id = ? ORDER BY created_at DESC LIMIT ?
       ) AND id != COALESCE((SELECT schedule_dotconfig_version_id FROM templates WHERE id = ?), '')
-      AND id != COALESCE((SELECT dotconfig_version_id FROM templates WHERE id = ?), '')`
+      AND id != COALESCE((SELECT dotconfig_version_id FROM templates WHERE id = ?), '')
+      AND id != COALESCE((SELECT pin_dotconfig_version_id FROM templates WHERE id = ?), '')`
     )
-      .bind(templateId, templateId, MAX_HISTORY_PER_TEMPLATE, templateId, templateId)
+      .bind(templateId, templateId, MAX_HISTORY_PER_TEMPLATE, templateId, templateId, templateId)
       .run();
   }
   
@@ -515,8 +576,8 @@ function json(data, status = 200, extraHeaders = {}) {
     if (tpl.dotconfig_version_id === versionId) {
       return err('该版本已设为当前版本，请先切换引用再删除', 409);
     }
-    if (tpl.schedule_dotconfig_version_id === versionId) {
-      return err('该版本已被定时任务引用，请先切换引用再删除', 409);
+    if (tpl.schedule_dotconfig_version_id === versionId || tpl.pin_dotconfig_version_id === versionId) {
+      return err('该版本已固定为配置底稿，请先取消固定再删除', 409);
     }
   
     await env.DB.prepare('DELETE FROM dotconfig_history WHERE id = ?').bind(versionId).run();
@@ -537,10 +598,6 @@ function json(data, status = 200, extraHeaders = {}) {
     const cron = body.cron !== undefined ? body.cron : tpl.schedule_cron;
     const versionId = body.dotconfig_version_id !== undefined && body.dotconfig_version_id !== null ? body.dotconfig_version_id : tpl.schedule_dotconfig_version_id;
   
-    if (enabled && !versionId) {
-      return err('定时编译必须选择一个 .config 版本，否则无法启用');
-    }
-  
     if (versionId) {
       const version = await env.DB.prepare(
         'SELECT id FROM dotconfig_history WHERE id = ? AND template_id = ?'
@@ -553,7 +610,11 @@ function json(data, status = 200, extraHeaders = {}) {
     if (enabled && !cron) {
       return err('启用定时编译必须提供 cron 表达式');
     }
-  
+    if (enabled && !versionId && !tpl.pin_dotconfig_version_id) {
+      const hasList = safeJsonParse(tpl.packages, []).length > 0 || !!tpl.profile;
+      if (!hasList) return err('这个模板还没有插件清单或机型，也没有固定的 .config，无法定时编译');
+    }
+
     await env.DB.prepare(
       `UPDATE templates SET schedule_cron=?, schedule_enabled=?, schedule_dotconfig_version_id=?, updated_at=? WHERE id=?`
     )
@@ -599,6 +660,11 @@ function json(data, status = 200, extraHeaders = {}) {
         plugins: safeJsonParse(tpl.plugins, []),
         diy_script_1: tpl.diy_script_1 || '',
         diy_script_2: tpl.diy_script_2 || '',
+        packages: safeJsonParse(tpl.packages, []),
+        profile: tpl.profile || '',
+        selection: safeJsonParse(tpl.selection, []),
+        project_id: tpl.project_id || '',
+        menuconfig: !!tpl.menuconfig,
       },
       dotconfig: versionRow ? { content: versionRow.content, label: versionRow.label || null } : null,
     };
@@ -643,7 +709,9 @@ function json(data, status = 200, extraHeaders = {}) {
   
     const templateId = uuid();
     const ts = now();
-    const plugins = JSON.stringify(Array.isArray(t.plugins) ? t.plugins : []);
+    const sp = sanitizePlugins(Array.isArray(t.plugins) ? t.plugins : []);
+    if (sp.error) return err(sp.error);
+    const plugins = JSON.stringify(sp.plugins);
   
     await env.DB.prepare(
       `INSERT INTO templates (id, name, repo_url, branch, target, plugins, diy_script_1, diy_script_2, dotconfig_version_id, schedule_cron, schedule_enabled, schedule_dotconfig_version_id, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
@@ -666,6 +734,10 @@ function json(data, status = 200, extraHeaders = {}) {
       )
       .run();
   
+    await env.DB.prepare('UPDATE templates SET packages=?, profile=?, selection=?, project_id=?, menuconfig=? WHERE id=?')
+      .bind(JSON.stringify(sanitizeIds(t.packages, 800)), (t.profile && PKG_RE.test(t.profile)) ? t.profile : null,
+        JSON.stringify(sanitizeIds(t.selection, 400)), (t.project_id && PROJECT_ID_RE.test(t.project_id)) ? t.project_id : null, t.menuconfig ? 1 : 0, templateId).run();
+
     if (body.dotconfig && typeof body.dotconfig.content === 'string' && body.dotconfig.content.trim()) {
       if (body.dotconfig.content.length > MAX_DOTCONFIG_SIZE) {
         return err('dotconfig.content 超过 2MB 限制', 413);
@@ -756,8 +828,10 @@ function json(data, status = 200, extraHeaders = {}) {
       return err('已有任务在执行中，请等待完成后再触发', 409);
     }
   
-    // 底稿版本：可为空（从零开始）
-    let dotconfigVersionId = body.dotconfig_version_id || null;
+    // 配置底稿：请求里明确给了就用请求的（空字符串 = 不固定）；否则只用模板上「固定」的版本。
+    // 不再自动沿用「当前版本」，否则旧选择里已经去掉的插件会残留。
+    const fromBody = body.dotconfig_version_id !== undefined;
+    let dotconfigVersionId = fromBody ? (body.dotconfig_version_id || null) : (tpl.pin_dotconfig_version_id || null);
     let dotconfigSnapshot = null;
     if (dotconfigVersionId) {
       const version = await env.DB.prepare(
@@ -765,7 +839,7 @@ function json(data, status = 200, extraHeaders = {}) {
       )
         .bind(dotconfigVersionId, body.template_id)
         .first();
-      if (!version) return err('指定的 .config 底稿版本不存在', 404);
+      if (!version) return err(fromBody ? '指定的 .config 底稿版本不存在' : '模板固定的 .config 版本已不存在，请在模板页重新选择', fromBody ? 404 : 409);
       dotconfigSnapshot = version.content;
     }
   
@@ -790,6 +864,18 @@ function json(data, status = 200, extraHeaders = {}) {
       )
       .run();
   
+    const packages = (Array.isArray(body.packages) ? body.packages : safeJsonParse(tpl.packages, [])).filter((p) => typeof p === 'string' && PKG_RE.test(p));
+    const profile = body.profile || tpl.profile || null;
+    const askMenuconfig = body.menuconfig !== undefined ? !!body.menuconfig : !!tpl.menuconfig;
+    // 没有清单、没有机型、也没有固定底稿的旧模板，只能靠 menuconfig 选设备
+    const wantMenuconfig = askMenuconfig ? 1 : ((packages.length || profile || dotconfigSnapshot) ? 0 : 1);
+    if (profile && !PKG_RE.test(profile)) {
+      await env.DB.prepare("UPDATE builds SET status='failed', fail_reason=?, updated_at=? WHERE id=?").bind('机型 profile 格式非法', now(), buildId).run();
+      return err('机型 profile 格式非法', 400);
+    }
+    await env.DB.prepare('UPDATE builds SET packages=?, profile=?, menuconfig=? WHERE id=?')
+      .bind(JSON.stringify(packages), profile, wantMenuconfig, buildId).run();
+
     try {
       await dispatchGithubWorkflow(env, buildId);
     } catch (e) {
@@ -809,14 +895,16 @@ function json(data, status = 200, extraHeaders = {}) {
   
   async function handleListBuilds(request, env, url) {
     const limit = Math.min(Number(url.searchParams.get('limit')) || 50, 200);
+    // 终端地址含密码：只在 menuconfig 阶段下发，结束后不再返回
     const { results } = await env.DB.prepare(
-      `SELECT id, template_id, repo_url, branch, target, dotconfig_version_id, trigger_type, schedule_cron, status, web_url, download_url, created_at, updated_at FROM builds ORDER BY created_at DESC LIMIT ?`
-    )
-      .bind(limit)
-      .all();
+      `SELECT id, template_id, repo_url, branch, target, profile, dotconfig_version_id, trigger_type, schedule_cron, status,
+              CASE WHEN status='menuconfig' THEN web_url END AS web_url,
+              download_url, fail_reason, log_tail, created_at, updated_at
+       FROM builds ORDER BY created_at DESC LIMIT ?`
+    ).bind(limit).all();
     return json({ builds: results });
   }
-  
+
   async function handleGetBuild(request, env, id) {
     const row = await env.DB.prepare('SELECT * FROM builds WHERE id = ?').bind(id).first();
     if (!row) return err('编译记录不存在', 404);
@@ -828,7 +916,7 @@ function json(data, status = 200, extraHeaders = {}) {
     const row = await env.DB.prepare('SELECT * FROM builds WHERE id = ?').bind(id).first();
     if (!row) return err('编译记录不存在', 404);
   
-    if (!ACTIVE_STATUSES.includes(row.status)) {
+    if (![...ACTIVE_STATUSES, 'queued'].includes(row.status)) {
       return err(`当前状态为「${STATUS_LABELS_BACKEND[row.status] || row.status}」，无需取消`, 409);
     }
   
@@ -845,10 +933,11 @@ function json(data, status = 200, extraHeaders = {}) {
       githubCancelError = 'workflow 尚未上报 run_id（可能还在排队阶段），仅在本系统中标记为已取消，GitHub Actions 那边的任务请手动去仓库的 Actions 页面取消';
     }
   
-    await env.DB.prepare('UPDATE builds SET status=?, updated_at=? WHERE id=?')
+    await env.DB.prepare('UPDATE builds SET status=?, web_url=NULL, updated_at=? WHERE id=?')
       .bind('cancelled', now(), id)
       .run();
   
+    await dispatchNextQueued(env).catch(() => {});
     return json({ ok: true, github_cancel_warning: githubCancelError || undefined });
   }
   
@@ -891,6 +980,9 @@ function json(data, status = 200, extraHeaders = {}) {
       diy_script_2: row.diy_script_2 || '',
       dotconfig_snapshot: row.dotconfig_snapshot || '',
       trigger_type: row.trigger_type || 'manual',
+      packages: safeJsonParse(row.packages, []),
+      profile: row.profile || '',
+      menuconfig: row.menuconfig !== 0,
       worker_url: workerUrl || '',
     });
   }
@@ -906,41 +998,32 @@ function json(data, status = 200, extraHeaders = {}) {
   
   async function handleWorkflowReport(request, env) {
     const body = await request.json().catch(() => null);
-    if (!body || !body.build_id || !body.status) {
-      return err('缺少 build_id 或 status');
-    }
-    if (!WORKFLOW_REPORTABLE_STATUSES.includes(body.status)) {
-      return err(`未知 status: ${body.status}`);
-    }
-  
-    const row = await env.DB.prepare('SELECT id FROM builds WHERE id = ?').bind(body.build_id).first();
+    if (!body || !body.build_id || !body.status) return err('缺少 build_id 或 status');
+    if (!WORKFLOW_REPORTABLE_STATUSES.includes(body.status)) return err(`未知 status: ${body.status}`);
+
+    const row = await env.DB.prepare('SELECT status FROM builds WHERE id = ?').bind(body.build_id).first();
     if (!row) return err('build 不存在', 404);
-  
+    const TERMINAL = ['success', 'failed', 'cancelled'];
+    // 状态机：终态不可被覆盖（修复：用户取消后被 always() 步骤改写成 failed）
+    if (TERMINAL.includes(row.status)) return json({ ok: true, ignored: true });
+
     const fields = ['status=?'];
     const values = [body.status];
-    if (body.web_url !== undefined) {
-      fields.push('web_url=?');
-      values.push(body.web_url);
-    }
-    if (body.download_url !== undefined) {
-      fields.push('download_url=?');
-      values.push(body.download_url);
-    }
-    if (body.github_run_id !== undefined) {
-      fields.push('github_run_id=?');
-      values.push(String(body.github_run_id));
-    }
+    if (body.web_url !== undefined) { fields.push('web_url=?'); values.push(body.web_url); }
+    else if (TERMINAL.includes(body.status)) fields.push('web_url=NULL');
+    if (body.download_url !== undefined) { fields.push('download_url=?'); values.push(body.download_url); }
+    if (body.github_run_id !== undefined) { fields.push('github_run_id=?'); values.push(String(body.github_run_id)); }
+    if (body.reason) { fields.push('fail_reason=?'); values.push(String(body.reason).slice(0, 500)); }
+    if (body.log_tail) { fields.push('log_tail=?'); values.push(String(body.log_tail).slice(0, 8000)); }
     fields.push('updated_at=?');
     values.push(now());
     values.push(body.build_id);
-  
-    await env.DB.prepare(`UPDATE builds SET ${fields.join(', ')} WHERE id=?`)
-      .bind(...values)
-      .run();
-  
+
+    await env.DB.prepare(`UPDATE builds SET ${fields.join(', ')} WHERE id=?`).bind(...values).run();
+    if (TERMINAL.includes(body.status)) await dispatchNextQueued(env).catch(() => {});
     return json({ ok: true });
   }
-  
+
   // workflow 专用：推送 menuconfig 结果，写入版本历史（设计文档 9.2 节）
   async function handleWorkflowReportDotconfig(request, env) {
     const body = await request.json().catch(() => null);
@@ -992,16 +1075,16 @@ function json(data, status = 200, extraHeaders = {}) {
   // ============================================================
   async function runScheduledBuilds(env, cronString) {
     const { results } = await env.DB.prepare(
-      `SELECT t.*, h.content AS dotconfig_content FROM templates t JOIN dotconfig_history h ON h.id = t.schedule_dotconfig_version_id WHERE t.schedule_enabled = 1 AND t.schedule_cron = ? AND t.schedule_dotconfig_version_id IS NOT NULL`
+      `SELECT t.*, h.id AS pinned_vid, h.content AS dotconfig_content FROM templates t LEFT JOIN dotconfig_history h ON h.id = COALESCE(t.pin_dotconfig_version_id, t.schedule_dotconfig_version_id) WHERE t.schedule_enabled = 1 AND t.schedule_cron = ?`
     )
       .bind(cronString)
       .all();
   
     for (const template of results) {
-      if (await hasActiveBuild(env)) {
-        console.log(`跳过模板 ${template.name}：已有任务在执行中`);
-        continue;
-      }
+      // 没有固定底稿时按「机型 + 插件清单」每次重新生成；两样都没有就没东西可编译
+      const hasList = safeJsonParse(template.packages, []).length > 0 || !!template.profile;
+      if (!template.dotconfig_content && !hasList) { console.log(`模板 ${template.name} 没有插件清单也没有固定配置，已跳过定时编译`); continue; }
+      const busy = await hasActiveBuild(env);
   
       const buildId = uuid();
       const ts = now();
@@ -1017,14 +1100,17 @@ function json(data, status = 200, extraHeaders = {}) {
           template.plugins,
           template.diy_script_1,
           template.diy_script_2,
-          template.schedule_dotconfig_version_id,
-          template.dotconfig_content,
+          template.dotconfig_content ? template.pinned_vid : null,
+          template.dotconfig_content || null,
           cronString,
           ts,
           ts
         )
         .run();
   
+      await env.DB.prepare('UPDATE builds SET packages=?, profile=?, menuconfig=0 WHERE id=?').bind(template.packages || '[]', template.profile || null, buildId).run();
+      if (busy) { await env.DB.prepare("UPDATE builds SET status='queued' WHERE id=?").bind(buildId).run(); continue; }
+
       try {
         await dispatchGithubWorkflow(env, buildId);
       } catch (e) {
@@ -1165,6 +1251,429 @@ function json(data, status = 200, extraHeaders = {}) {
     return json({ ok: true, scope: 'github' });
   }
   
+
+  // ============================================================
+  // 插件目录（商店数据）与自动建表迁移
+  // ============================================================
+  // 内置回退目录：由 tools/build_worker.py 从根目录 catalog.json 写入，Worker 平时优先在线读取仓库里的 catalog.json
+  const STORE_FALLBACK = /*CATALOG:BEGIN*/{"schema":1,"updated":"2026-10-19","upstream":{"repo":"https://github.com/immortalwrt/luci","branch":"openwrt-24.10","commit":"80ed8a44f244627c5a9f808d09f4c3d8f985b764"},"categories":[{"id":"代理","order":1,"keywords":"科学 上网 翻墙 梯子 分流 订阅 节点"},{"id":"DNS 与广告","order":2,"keywords":"去广告 屏蔽 广告 解析 防污染"},{"id":"网络","order":3,"keywords":"路由 拨号 负载 限速 唤醒 校园网"},{"id":"VPN 与穿透","order":4,"keywords":"内网穿透 远程 异地组网 回家 vpn"},{"id":"服务","order":5,"keywords":""},{"id":"存储","order":6,"keywords":"网盘 共享 文件 硬盘 nas ftp"},{"id":"下载","order":7,"keywords":"下载 磁力 bt 种子"},{"id":"容器","order":8,"keywords":"虚拟化 docker 容器"},{"id":"监控","order":9,"keywords":"监控 流量 统计 状态 温度"},{"id":"多媒体","order":10,"keywords":"音乐 影音 投屏"},{"id":"系统","order":11,"keywords":"重启 终端 权限 定时 屏幕"},{"id":"协议","order":12,"keywords":"接口 协议 拨号 隧道"},{"id":"主题","order":13,"keywords":"主题 界面 皮肤 外观"},{"id":"其它","order":14,"keywords":""}],"sources":[{"id":"immortalwrt-24.10","name":"ImmortalWrt","repo_url":"https://github.com/immortalwrt/immortalwrt","branch":"openwrt-24.10"},{"id":"immortalwrt-23.05","name":"ImmortalWrt","repo_url":"https://github.com/immortalwrt/immortalwrt","branch":"openwrt-23.05"},{"id":"immortalwrt-master","name":"ImmortalWrt","repo_url":"https://github.com/immortalwrt/immortalwrt","branch":"master"},{"id":"openwrt-24.10","name":"OpenWrt 官方","repo_url":"https://github.com/openwrt/openwrt","branch":"openwrt-24.10"},{"id":"lede-master","name":"LEDE","repo_url":"https://github.com/coolsnowwolf/lede","branch":"master"}],"plugins":[{"id":"luci-app-homeproxy","name":"HomeProxy","desc":"基于 sing-box 的轻量代理，界面简洁。","desc_en":"The modern ImmortalWrt proxy platform for ARM64/AMD64","cat":"代理","kind":"app","origin":{"type":"builtin"},"deps":["sing-box","firewall4","kmod-nft-tproxy","ucode-mod-digest"],"requires":[],"size_mb":3.5,"rec":false,"tut":"在「服务 → HomeProxy」导入节点即可。","tags":[],"hidden":false},{"id":"luci-app-openclash","name":"openclash","desc":"兼容 Clash 配置的代理客户端，内核体积较大。","desc_en":"","cat":"代理","kind":"app","origin":{"type":"builtin"},"deps":[],"requires":[],"size_mb":9,"rec":false,"tut":"上传配置文件或订阅地址，并下载内核。","tags":[],"hidden":false},{"id":"luci-app-passwall","name":"passwall","desc":"多节点、分流规则完整的代理工具。","desc_en":"LuCI support for PassWall","cat":"代理","kind":"app","origin":{"type":"builtin"},"deps":["coreutils","coreutils-base64","coreutils-nohup","curl","chinadns-ng","dns2socks","ip-full","libuci-lua","lua","luci-lib-jsonc","microsocks","resolveip","tcping","unzip","ipt2socks","kmod-nft-socket","kmod-nft-tproxy","kmod-nft-nat","PACKAGE_$(PKG_NAME)_INCLUDE_Brook:brook","PACKAGE_$(PKG_NAME)_INCLUDE_Haproxy:haproxy","PACKAGE_$(PKG_NAME)_INCLUDE_Hysteria:hysteria","PACKAGE_$(PKG_NAME)_INCLUDE_NaiveProxy:naiveproxy","PACKAGE_$(PKG_NAME)_INCLUDE_Shadowsocks_Rust_Client:shadowsocks-rust-sslocal","PACKAGE_$(PKG_NAME)_INCLUDE_Shadowsocks_Rust_Server:shadowsocks-rust-ssserver","PACKAGE_$(PKG_NAME)_INCLUDE_Shadow_TLS:shadow-tls","PACKAGE_$(PKG_NAME)_INCLUDE_Simple_Obfs:simple-obfs-client","PACKAGE_$(PKG_NAME)_INCLUDE_SingBox:sing-box","PACKAGE_$(PKG_NAME)_INCLUDE_tuic_client:tuic-client","PACKAGE_$(PKG_NAME)_INCLUDE_V2ray_Geodata:v2ray-geoip","PACKAGE_$(PKG_NAME)_INCLUDE_V2ray_Geodata:v2ray-geosite","PACKAGE_$(PKG_NAME)_INCLUDE_V2ray_Geoview:geoview","PACKAGE_$(PKG_NAME)_INCLUDE_V2ray_Plugin:v2ray-plugin","PACKAGE_$(PKG_NAME)_INCLUDE_Xray:xray-core","PACKAGE_$(PKG_NAME)_INCLUDE_Xray_Plugin:xray-plugin"],"requires":[],"size_mb":1.8,"rec":false,"tut":"装好后先添加订阅，再选择分流模式。","tags":[],"hidden":false},{"id":"luci-app-privoxy","name":"privoxy","desc":"LuCI Support for Privoxy WEB proxy","desc_en":"LuCI Support for Privoxy WEB proxy","cat":"代理","kind":"app","origin":{"type":"builtin"},"deps":["luci-lib-ipkg","privoxy"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-v2raya","name":"v2rayA","desc":"LuCI support for v2rayA","desc_en":"LuCI support for v2rayA","cat":"代理","kind":"app","origin":{"type":"builtin"},"deps":["v2raya"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-adblock","name":"Adblock","desc":"LuCI support for Adblock","desc_en":"LuCI support for Adblock","cat":"DNS 与广告","kind":"app","origin":{"type":"builtin"},"deps":["adblock"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-adblock-fast","name":"AdBlock Fast","desc":"AdBlock-Fast Web UI","desc_en":"AdBlock-Fast Web UI","cat":"DNS 与广告","kind":"app","origin":{"type":"builtin"},"deps":["adblock-fast","rpcd-mod-ucode"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-arpbind","name":"IP/MAC绑定","desc":"LuCI support for ARP binding","desc_en":"LuCI support for ARP binding","cat":"DNS 与广告","kind":"app","origin":{"type":"builtin"},"deps":["ip"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-banip","name":"banIP","desc":"LuCI support for banIP","desc_en":"LuCI support for banIP","cat":"DNS 与广告","kind":"app","origin":{"type":"builtin"},"deps":["banip"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-ddns","name":"动态 DNS","desc":"LuCI Support for Dynamic DNS Client (ddns-scripts)","desc_en":"LuCI Support for Dynamic DNS Client (ddns-scripts)","cat":"DNS 与广告","kind":"app","origin":{"type":"builtin"},"deps":["ddns-scripts"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-ddns-go","name":"DDNS-Go","desc":"自动把公网 IP 解析到你的域名。","desc_en":"LuCI support for DDNS-Go","cat":"DNS 与广告","kind":"app","origin":{"type":"builtin"},"deps":["ddns-go"],"requires":[],"size_mb":3,"rec":false,"tut":"打开 9876 端口，填写服务商密钥。","tags":[],"hidden":false},{"id":"luci-app-https-dns-proxy","name":"HTTPS DNS 代理","desc":"DNS Over HTTPS Proxy Web UI","desc_en":"DNS Over HTTPS Proxy Web UI","cat":"DNS 与广告","kind":"app","origin":{"type":"builtin"},"deps":["https-dns-proxy"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-smartdns","name":"SmartDNS","desc":"多上游并发解析，选最快的结果。","desc_en":"LuCI for smartdns","cat":"DNS 与广告","kind":"app","origin":{"type":"builtin"},"deps":["smartdns"],"requires":[],"size_mb":1.2,"rec":false,"tut":"勾选「重定向 53 端口」即可生效。","tags":[],"hidden":false},{"id":"luci-app-unbound","name":"unbound","desc":"Unbound Recursive DNS Resolver Configuration","desc_en":"Unbound Recursive DNS Resolver Configuration","cat":"DNS 与广告","kind":"app","origin":{"type":"builtin"},"deps":["unbound-daemon"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-3ginfo-lite","name":"模块","desc":"LuCI JS Support for 3ginfo-lite","desc_en":"LuCI JS Support for 3ginfo-lite","cat":"网络","kind":"app","origin":{"type":"builtin"},"deps":["sms-tool","comgt","kmod-usb-serial-option"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-appfilter","name":"appfilter","desc":"LuCI support for OAF","desc_en":"LuCI support for OAF","cat":"网络","kind":"app","origin":{"type":"builtin"},"deps":["appfilter"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-bcp38","name":"BCP38","desc":"BCP38 LuCI interface","desc_en":"BCP38 LuCI interface","cat":"网络","kind":"app","origin":{"type":"builtin"},"deps":["bcp38"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-bmx7","name":"bmx7","desc":"LuCI support for BMX7","desc_en":"LuCI support for BMX7","cat":"网络","kind":"app","origin":{"type":"builtin"},"deps":["luci-lib-json","bmx7","bmx7-json"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-cd8021x","name":"Content-Type: text/plain; charset=UTF-8\\n","desc":"a wired IEEE 802.1x client for Luci","desc_en":"a wired IEEE 802.1x client for Luci","cat":"网络","kind":"app","origin":{"type":"builtin"},"deps":["wpad"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-dawn","name":"DAWN","desc":"LuCI support for DAWN","desc_en":"LuCI support for DAWN","cat":"网络","kind":"app","origin":{"type":"builtin"},"deps":["dawn"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-dcwapd","name":"双通道 WiFi","desc":"Dual Channel Wi-Fi AP Daemon configuration module","desc_en":"Dual Channel Wi-Fi AP Daemon configuration module","cat":"网络","kind":"app","origin":{"type":"builtin"},"deps":["dcwapd"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-eoip","name":"EoIP 隧道","desc":"LuCI Support for EoIP","desc_en":"LuCI Support for EoIP","cat":"网络","kind":"app","origin":{"type":"builtin"},"deps":["eoip"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-eqos","name":"网速控制","desc":"LuCI support for Easy QoS","desc_en":"LuCI support for Easy QoS","cat":"网络","kind":"app","origin":{"type":"builtin"},"deps":["tc","kmod-sched-core","kmod-ifb"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-haproxy-tcp","name":"haproxy-tcp","desc":"luci for haproxy and shadowsocks","desc_en":"luci for haproxy and shadowsocks","cat":"网络","kind":"app","origin":{"type":"builtin"},"deps":["haproxy"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-lorawan-basicstation","name":"LoRaWAN Basicstation","desc":"LuCI Support for LoRaWAN basicstation","desc_en":"LuCI Support for LoRaWAN basicstation","cat":"网络","kind":"app","origin":{"type":"builtin"},"deps":["basicstation"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-modemband","name":"Modem","desc":"LuCI JS Support for modemband application","desc_en":"LuCI JS Support for modemband application","cat":"网络","kind":"app","origin":{"type":"builtin"},"deps":["modemband"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-mwan3","name":"MultiWAN 管理器","desc":"多条宽带叠加或互为备份。","desc_en":"LuCI support for the MWAN3 MultiWAN Manager","cat":"网络","kind":"app","origin":{"type":"builtin"},"deps":["mwan3"],"requires":[],"size_mb":0.2,"rec":false,"tut":"先添加接口，再设置成员和策略。","tags":[],"hidden":false},{"id":"luci-app-nft-qos","name":"nft-qos","desc":"QoS over Nftables","desc_en":"QoS over Nftables","cat":"网络","kind":"app","origin":{"type":"builtin"},"deps":["nft-qos"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-njitclient","name":"njitclient","desc":"NJIT 802.1X Client for LuCI","desc_en":"NJIT 802.1X Client for LuCI","cat":"网络","kind":"app","origin":{"type":"builtin"},"deps":["njit8021xclient"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-olsr","name":"OLSR IPv4","desc":"OLSR configuration and status module","desc_en":"OLSR configuration and status module","cat":"网络","kind":"app","origin":{"type":"builtin"},"deps":["olsrd"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-olsr-services","name":"olsr-services","desc":"Show services announced with the nameservice plugin","desc_en":"Show services announced with the nameservice plugin","cat":"网络","kind":"app","origin":{"type":"builtin"},"deps":["luci-app-olsr","olsrd","olsrd-mod-nameservice"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-olsr-viz","name":"olsr-viz","desc":"OLSR Visualisation","desc_en":"OLSR Visualisation","cat":"网络","kind":"app","origin":{"type":"builtin"},"deps":["luci-app-olsr","olsrd","olsrd-mod-txtinfo"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-pppoe-relay","name":"pppoe-relay","desc":"LuCI support for PPPoE Relay","desc_en":"LuCI support for PPPoE Relay","cat":"网络","kind":"app","origin":{"type":"builtin"},"deps":["rp-pppoe-common","rp-pppoe-relay"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-pppoe-server","name":"pppoe-server","desc":"LuCI support for PPPoE Server","desc_en":"LuCI support for PPPoE Server","cat":"网络","kind":"app","origin":{"type":"builtin"},"deps":["rp-pppoe-common","rp-pppoe-server"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-qos","name":"QoS","desc":"Quality of Service configuration module","desc_en":"Quality of Service configuration module","cat":"网络","kind":"app","origin":{"type":"builtin"},"deps":["qos-scripts"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-rp-pppoe-server","name":"RP PPPoE 服务器","desc":"Roaring Penguin PPPoE Server","desc_en":"Roaring Penguin PPPoE Server","cat":"网络","kind":"app","origin":{"type":"builtin"},"deps":["rp-pppoe-server"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-scutclient","name":"scutclient","desc":"LuCI Support for scutclient","desc_en":"LuCI Support for scutclient","cat":"网络","kind":"app","origin":{"type":"builtin"},"deps":["scutclient"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-siitwizard","name":"SIIT 4over6 assistant","desc":"SIIT IPv4-over-IPv6 configuration wizard","desc_en":"SIIT IPv4-over-IPv6 configuration wizard","cat":"网络","kind":"app","origin":{"type":"builtin"},"deps":["kmod-siit"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-sms-tool-js","name":"sms-tool-js","desc":"LuCI JS Support for sms-tool","desc_en":"LuCI JS Support for sms-tool","cat":"网络","kind":"app","origin":{"type":"builtin"},"deps":["sms-tool","kmod-usb-serial","kmod-usb-serial-option","comgt"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-socat","name":"Socat 端口转发","desc":"功能较全的 TCP/UDP 转发工具（作者自维护仓库）。","desc_en":"","cat":"网络","kind":"app","origin":{"type":"git","name":"luci-app-socat","url":"https://github.com/mylucien/luci-app-socat","branch":"","sparse":false,"dirs":[]},"deps":["socat"],"requires":[],"size_mb":0.1,"rec":false,"tut":"在「网络 → Socat」添加规则。","tags":[],"hidden":false},{"id":"luci-app-sqm","name":"SQM 队列管理","desc":"LuCI Support for SQM Scripts","desc_en":"LuCI Support for SQM Scripts","cat":"网络","kind":"app","origin":{"type":"builtin"},"deps":["sqm-scripts"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-syncdial","name":"syncdial","desc":"Virtual WAN config generator","desc_en":"Virtual WAN config generator","cat":"网络","kind":"app","origin":{"type":"builtin"},"deps":["kmod-macvlan","luci-app-mwan3"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-timewol","name":"timewol","desc":"LuCI support for Timewol","desc_en":"LuCI support for Timewol","cat":"网络","kind":"app","origin":{"type":"builtin"},"deps":[],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-ua2f","name":"UA2F","desc":"LuCI support for ua2f","desc_en":"LuCI support for ua2f","cat":"网络","kind":"app","origin":{"type":"builtin"},"deps":["ua2f"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-usteer","name":"Usteer","desc":"LuCI usteer app for js based luci","desc_en":"LuCI usteer app for js based luci","cat":"网络","kind":"app","origin":{"type":"builtin"},"deps":["usteer"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-vlmcsd","name":"Vlmcsd KMS 服务器","desc":"LuCI support for Vlmcsd KMS Server","desc_en":"LuCI support for Vlmcsd KMS Server","cat":"网络","kind":"app","origin":{"type":"builtin"},"deps":["vlmcsd"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-wifischedule","name":"wifi定时","desc":"Turns WiFi on and off according to a schedule","desc_en":"Turns WiFi on and off according to a schedule","cat":"网络","kind":"app","origin":{"type":"builtin"},"deps":["wifischedule"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-wol","name":"网络唤醒","desc":"LuCI Support for Wake-on-LAN","desc_en":"LuCI Support for Wake-on-LAN","cat":"网络","kind":"app","origin":{"type":"builtin"},"deps":["etherwake"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-xlnetacc","name":"xlnetacc","desc":"LuCI Support for XLNetAcc","desc_en":"LuCI Support for XLNetAcc","cat":"网络","kind":"app","origin":{"type":"builtin"},"deps":["jshn","wget-ssl","openssl-util"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-cloudflared","name":"Cloudflare 零信任隧道","desc":"LuCI for Cloudflared","desc_en":"LuCI for Cloudflared","cat":"VPN 与穿透","kind":"app","origin":{"type":"builtin"},"deps":["cloudflared"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-frpc","name":"frp 客户端","desc":"LuCI Support for frp client","desc_en":"LuCI Support for frp client","cat":"VPN 与穿透","kind":"app","origin":{"type":"builtin"},"deps":["frpc"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-frps","name":"frp 服务器","desc":"LuCI Support for frp server","desc_en":"LuCI Support for frp server","cat":"VPN 与穿透","kind":"app","origin":{"type":"builtin"},"deps":["frps"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-ipsec-vpnd","name":"IPSec VPN 服务器","desc":"LuCI support for IPSec VPN Server (IKEv1 with PSK and Xauth)","desc_en":"LuCI support for IPSec VPN Server (IKEv1 with PSK and Xauth)","cat":"VPN 与穿透","kind":"app","origin":{"type":"builtin"},"deps":["strongswan","strongswan-minimal","strongswan-mod-xauth-generic","strongswan-mod-kernel-libipsec","kmod-tun"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-libreswan","name":"Libreswan IPSec","desc":"Luci Application for IPSec VPN (Libreswan)","desc_en":"Luci Application for IPSec VPN (Libreswan)","cat":"VPN 与穿透","kind":"app","origin":{"type":"builtin"},"deps":["libreswan"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-n2n","name":"n2n","desc":"n2n VPN Configuration module","desc_en":"n2n VPN Configuration module","cat":"VPN 与穿透","kind":"app","origin":{"type":"builtin"},"deps":["n2n"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-ngrokc","name":"Content-Type: text/plain; charset=UTF-8\\n","desc":"LuCI support for ngrokc.","desc_en":"LuCI support for ngrokc.","cat":"VPN 与穿透","kind":"app","origin":{"type":"builtin"},"deps":["ngrokc"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-nps","name":"nps","desc":"LuCI for Nps","desc_en":"LuCI for Nps","cat":"VPN 与穿透","kind":"app","origin":{"type":"builtin"},"deps":["wget-ssl","npc"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-ocserv","name":"ocserv","desc":"LuCI Support for OpenConnect VPN","desc_en":"LuCI Support for OpenConnect VPN","cat":"VPN 与穿透","kind":"app","origin":{"type":"builtin"},"deps":["ocserv","certtool"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-openvpn","name":"openvpn","desc":"LuCI Support for OpenVPN","desc_en":"LuCI Support for OpenVPN","cat":"VPN 与穿透","kind":"app","origin":{"type":"builtin"},"deps":[],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-openvpn-server","name":"openvpn-server","desc":"LuCI support for OpenVPN Server","desc_en":"LuCI support for OpenVPN Server","cat":"VPN 与穿透","kind":"app","origin":{"type":"builtin"},"deps":["openvpn-openssl","openvpn-easy-rsa","kmod-tun"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-softethervpn","name":"softethervpn","desc":"LuCI support for SoftEtherVPN","desc_en":"LuCI support for SoftEtherVPN","cat":"VPN 与穿透","kind":"app","origin":{"type":"builtin"},"deps":["zlib","libpthread","librt","libreadline","libncurses","libiconv-full","kmod-tun","libopenssl","softethervpn5-bridge","softethervpn5-client","softethervpn5-server"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-strongswan-swanctl","name":"strongSwan IPsec","desc":"LuCI support for strongSwan via swanctl","desc_en":"LuCI support for strongSwan via swanctl","cat":"VPN 与穿透","kind":"app","origin":{"type":"builtin"},"deps":["strongswan-swanctl","swanmon"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-xfrpc","name":"反向代理","desc":"LuCI Support for xfrpc","desc_en":"LuCI Support for xfrpc","cat":"VPN 与穿透","kind":"app","origin":{"type":"builtin"},"deps":["xfrpc"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-zerotier","name":"ZeroTier","desc":"LuCI for Zerotier","desc_en":"LuCI for Zerotier","cat":"VPN 与穿透","kind":"app","origin":{"type":"builtin"},"deps":["zerotier"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-3cat","name":"3cat","desc":"LuCI support for simple port forwarding via 3proxy","desc_en":"LuCI support for simple port forwarding via 3proxy","cat":"服务","kind":"app","origin":{"type":"builtin"},"deps":["3proxy-mod-tcppm","3proxy-mod-udppm"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-acme","name":"ACME 证书","desc":"ACME package - LuCI interface","desc_en":"ACME package - LuCI interface","cat":"服务","kind":"app","origin":{"type":"builtin"},"deps":["acme"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-antiblock","name":"AntiBlock","desc":"AntiBlock Web UI","desc_en":"AntiBlock Web UI","cat":"服务","kind":"app","origin":{"type":"builtin"},"deps":["antiblock"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-apinger","name":"Apinger","desc":"LuCI support for the Apinger","desc_en":"LuCI support for the Apinger","cat":"服务","kind":"app","origin":{"type":"builtin"},"deps":["apinger","apinger-rrd"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-bitsrunlogin-go","name":"深澜登录器","desc":"LuCI app for BitSrunLoginGo (Bit Srun auto login tool)","desc_en":"LuCI app for BitSrunLoginGo (Bit Srun auto login tool)","cat":"服务","kind":"app","origin":{"type":"builtin"},"deps":["bitsrunlogin-go"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-chrony","name":"Chrony","desc":"LuCI support for chrony","desc_en":"LuCI support for chrony","cat":"服务","kind":"app","origin":{"type":"builtin"},"deps":["chrony-nts"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-clamav","name":"ClamAV","desc":"ClamAV LuCI interface","desc_en":"ClamAV LuCI interface","cat":"服务","kind":"app","origin":{"type":"builtin"},"deps":["clamav"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-coovachilli","name":"CoovaChilli 网页认证","desc":"LuCI Support for Coova Chilli","desc_en":"LuCI Support for Coova Chilli","cat":"服务","kind":"app","origin":{"type":"builtin"},"deps":["coova-chilli"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-dae","name":"dae","desc":"LuCI app for dae","desc_en":"LuCI app for dae","cat":"服务","kind":"app","origin":{"type":"builtin"},"deps":["dae","dae-geoip","dae-geosite"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-daed","name":"daed","desc":"LuCI app for dae dashboard","desc_en":"LuCI app for dae dashboard","cat":"服务","kind":"app","origin":{"type":"builtin"},"deps":["daed","daed-geoip","daed-geosite"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-dufs","name":"Dufs","desc":"LuCI support for dufs","desc_en":"LuCI support for dufs","cat":"服务","kind":"app","origin":{"type":"builtin"},"deps":["dufs"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-dump1090","name":"dump1090","desc":"LuCI Support for dump1090","desc_en":"LuCI Support for dump1090","cat":"服务","kind":"app","origin":{"type":"builtin"},"deps":["dump1090"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-dynapoint","name":"动态点","desc":"LuCI Support for DynaPoint","desc_en":"LuCI Support for DynaPoint","cat":"服务","kind":"app","origin":{"type":"builtin"},"deps":["luci-lib-ipkg","dynapoint"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-email","name":"电子邮件服务器","desc":"LuCI app for email server configuration (EmailRelay)","desc_en":"LuCI app for email server configuration (EmailRelay)","cat":"服务","kind":"app","origin":{"type":"builtin"},"deps":["emailrelay"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-filebrowser-go","name":"FileBrowser","desc":"LuCI app for FileBrowser","desc_en":"LuCI app for FileBrowser","cat":"服务","kind":"app","origin":{"type":"builtin"},"deps":["filebrowser"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-fwknopd","name":"Firewall Knock 守护进程","desc":"Fwknopd config - web config for the firewall knock daemon","desc_en":"Fwknopd config - web config for the firewall knock daemon","cat":"服务","kind":"app","origin":{"type":"builtin"},"deps":["fwknopd","qrencode"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-gost","name":"GOST","desc":"LuCI support for GOST","desc_en":"LuCI support for GOST","cat":"服务","kind":"app","origin":{"type":"builtin"},"deps":["gost"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-irqbalance","name":"irqbalance","desc":"LuCI support for irqbalance","desc_en":"LuCI support for irqbalance","cat":"服务","kind":"app","origin":{"type":"builtin"},"deps":["irqbalance"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-keepalived","name":"VRRP","desc":"LuCI support for the Keepalived","desc_en":"LuCI support for the Keepalived","cat":"服务","kind":"app","origin":{"type":"builtin"},"deps":["keepalived","keepalived-sync"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-lldpd","name":"LLDP","desc":"LuCI support for LLDP daemon","desc_en":"LuCI support for LLDP daemon","cat":"服务","kind":"app","origin":{"type":"builtin"},"deps":["lldpd","rpcd-mod-ucode"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-microsocks","name":"MicroSocks","desc":"LuCI support for MicroSocks","desc_en":"LuCI support for MicroSocks","cat":"服务","kind":"app","origin":{"type":"builtin"},"deps":["microsocks"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-mosquitto","name":"Mosquitto","desc":"Mosquitto LuCI interface","desc_en":"Mosquitto LuCI interface","cat":"服务","kind":"app","origin":{"type":"builtin"},"deps":["mosquitto"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-msd_lite","name":"组播转换","desc":"LuCI support for Multi stream daemon lite","desc_en":"LuCI support for Multi stream daemon lite","cat":"服务","kind":"app","origin":{"type":"builtin"},"deps":["msd_lite"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-natmap","name":"NATMap","desc":"LuCI Support for natmap","desc_en":"LuCI Support for natmap","cat":"服务","kind":"app","origin":{"type":"builtin"},"deps":["natmap"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-nextdns","name":"NextDNS","desc":"LuCI support for NextDNS","desc_en":"LuCI support for NextDNS","cat":"服务","kind":"app","origin":{"type":"builtin"},"deps":["nextdns"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-nut","name":"网络 UPS 工具","desc":"Network UPS Tools Configuration","desc_en":"Network UPS Tools Configuration","cat":"服务","kind":"app","origin":{"type":"builtin"},"deps":["nut","nut-upsmon","nut-server","nut-upsc","nut-web-cgi","nut-upscmd"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-omcproxy","name":"组播代理","desc":"LuCI support for omcproxy","desc_en":"LuCI support for omcproxy","cat":"服务","kind":"app","origin":{"type":"builtin"},"deps":["omcproxy"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-openwisp","name":"OpenWISP","desc":"LuCI support for OpenWISP","desc_en":"LuCI support for OpenWISP","cat":"服务","kind":"app","origin":{"type":"builtin"},"deps":["openwisp-config"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-pagekitec","name":"PageKite出版商","desc":"LuCI Support for PageKite","desc_en":"LuCI Support for PageKite","cat":"服务","kind":"app","origin":{"type":"builtin"},"deps":["pagekitec"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-pbr","name":"策略路由","desc":"Policy Based Routing Service Web UI","desc_en":"Policy Based Routing Service Web UI","cat":"服务","kind":"app","origin":{"type":"builtin"},"deps":["jsonfilter","pbr"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-radicale3","name":"Radicale3","desc":"Radicale v3 CalDAV/CardDAV Server","desc_en":"Radicale v3 CalDAV/CardDAV Server","cat":"服务","kind":"app","origin":{"type":"builtin"},"deps":["radicale3","rpcd-mod-rad3-enc"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-rtp2httpd","name":"rtp2httpd","desc":"LuCI support for rtp2httpd","desc_en":"LuCI support for rtp2httpd","cat":"服务","kind":"app","origin":{"type":"builtin"},"deps":["rtp2httpd"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-rustdesk-server","name":"RustDesk 服务器","desc":"LuCI support for RustDesk Server","desc_en":"LuCI support for RustDesk Server","cat":"服务","kind":"app","origin":{"type":"builtin"},"deps":["rustdesk-server"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-ser2net","name":"串口命令转发(ser2net)","desc":"LuCI Support for ser2net","desc_en":"LuCI Support for ser2net","cat":"服务","kind":"app","origin":{"type":"builtin"},"deps":["ser2net"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-snmpd","name":"SNMPD","desc":"Net-SNMP LuCI interface","desc_en":"Net-SNMP LuCI interface","cat":"服务","kind":"app","origin":{"type":"builtin"},"deps":["snmpd"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-spotifyd","name":"Spotifyd","desc":"LuCI support for spotifyd","desc_en":"LuCI support for spotifyd","cat":"服务","kind":"app","origin":{"type":"builtin"},"deps":["spotifyd"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-squid","name":"Squid","desc":"Squid LuCI Interface","desc_en":"Squid LuCI Interface","cat":"服务","kind":"app","origin":{"type":"builtin"},"deps":["squid"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-sshtunnel","name":"SSH 隧道","desc":"LuCI support for SSH Tunnels (sshtunnel package)","desc_en":"LuCI support for SSH Tunnels (sshtunnel package)","cat":"服务","kind":"app","origin":{"type":"builtin"},"deps":["sshtunnel"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-sysuh3c","name":"SYSU H3C 客户端","desc":"LuCI support for SYSU H3C 802.1X Client","desc_en":"LuCI support for SYSU H3C 802.1X Client","cat":"服务","kind":"app","origin":{"type":"builtin"},"deps":["sysuh3c"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-tinyproxy","name":"Tinyproxy 服务器","desc":"Tinyproxy - HTTP(S)-Proxy configuration","desc_en":"Tinyproxy - HTTP(S)-Proxy configuration","cat":"服务","kind":"app","origin":{"type":"builtin"},"deps":["tinyproxy"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-tor","name":"Tor onion 路由","desc":"LuCI app to configure Tor","desc_en":"LuCI app to configure Tor","cat":"服务","kind":"app","origin":{"type":"builtin"},"deps":["tor","tor-hs"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-travelmate","name":"Travelmate","desc":"LuCI support for Travelmate","desc_en":"LuCI support for Travelmate","cat":"服务","kind":"app","origin":{"type":"builtin"},"deps":["luci-lib-uqr","travelmate"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-udpxy","name":"udpxy","desc":"LuCI Support for udpxy","desc_en":"LuCI Support for udpxy","cat":"服务","kind":"app","origin":{"type":"builtin"},"deps":["udpxy"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-wechatpush","name":"微信推送","desc":"LuCI support for wechatpush","desc_en":"LuCI support for wechatpush","cat":"服务","kind":"app","origin":{"type":"builtin"},"deps":["iputils-arping","curl","jq","bash","PACKAGE_WECHATPUSH_Enable_Local_Disk_Information_Detection:lsblk","PACKAGE_WECHATPUSH_Enable_Local_Disk_Information_Detection:smartmontools","PACKAGE_WECHATPUSH_Enable_Local_Disk_Information_Detection:smartmontools-drivedb","PACKAGE_WECHATPUSH_Enable_Host_Information_Detection:openssh-client","PACKAGE_WECHATPUSH_Enable_Host_Information_Detection:openssh-keygen"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-xinetd","name":"Xinetd","desc":"LuCI Support for xinetd","desc_en":"LuCI Support for xinetd","cat":"服务","kind":"app","origin":{"type":"builtin"},"deps":["xinetd"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-cifs-mount","name":"挂载 SMB 网络共享","desc":"LuCI for SMB/CIFS Mount","desc_en":"LuCI for SMB/CIFS Mount","cat":"存储","kind":"app","origin":{"type":"builtin"},"deps":["kmod-fs-cifs"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-diskman","name":"diskman","desc":"Disk Manager interface for LuCI","desc_en":"Disk Manager interface for LuCI","cat":"存储","kind":"app","origin":{"type":"builtin"},"deps":["blkid","e2fsprogs","parted","smartmontools","dosfstools","kmod-fs-msdos","kmod-fs-ntfs3","kmod-fs-exfat","exfat-mkfs","exfat-fsck","kmod-nls-cp932","kmod-nls-cp936","kmod-nls-cp950","PACKAGE_$(PKG_NAME)_INCLUDE_btrfs_progs:btrfs-progs","PACKAGE_$(PKG_NAME)_INCLUDE_lsblk:lsblk","PACKAGE_$(PKG_NAME)_INCLUDE_mdadm:mdadm","PACKAGE_$(PKG_NAME)_INCLUDE_kmod_md_raid456:mdadm","PACKAGE_$(PKG_NAME)_INCLUDE_kmod_md_raid456:kmod-md-raid456","PACKAGE_$(PKG_NAME)_INCLUDE_kmod_md_linears:mdadm","PACKAGE_$(PKG_NAME)_INCLUDE_kmod_md_linears:kmod-md-linear"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-hd-idle","name":"硬盘休眠","desc":"Hard Disk Idle Spin-Down module","desc_en":"Hard Disk Idle Spin-Down module","cat":"存储","kind":"app","origin":{"type":"builtin"},"deps":["hd-idle","lsblk"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-ksmbd","name":"网络共享","desc":"Network Shares - Ksmbd the SMB kernel fileserver","desc_en":"Network Shares - Ksmbd the SMB kernel fileserver","cat":"存储","kind":"app","origin":{"type":"builtin"},"deps":["ksmbd-server"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-minidlna","name":"miniDLNA","desc":"LuCI Support for miniDLNA","desc_en":"LuCI Support for miniDLNA","cat":"存储","kind":"app","origin":{"type":"builtin"},"deps":["minidlna"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-mjpg-streamer","name":"MJPG-streamer(网络摄像机串流)","desc":"MJPG-Streamer service configuration module","desc_en":"MJPG-Streamer service configuration module","cat":"存储","kind":"app","origin":{"type":"builtin"},"deps":["mjpg-streamer"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-nfs","name":"nfs","desc":"LuCI support for nfs","desc_en":"LuCI support for nfs","cat":"存储","kind":"app","origin":{"type":"builtin"},"deps":["nfs-utils","nfs-kernel-server","nfs-kernel-server-utils","mount-utils"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-openlist","name":"OpenList","desc":"把多个网盘聚合成统一的文件目录。","desc_en":"LuCI app for OpenList","cat":"存储","kind":"app","origin":{"type":"builtin"},"deps":["openlist"],"requires":[],"size_mb":12,"rec":false,"tut":"首次启动后在日志里查看管理员密码。","tags":[],"hidden":false},{"id":"luci-app-p910nd","name":"p910nd - 打印服务器","desc":"p910nd - Printer server module","desc_en":"p910nd - Printer server module","cat":"存储","kind":"app","origin":{"type":"builtin"},"deps":["p910nd"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-ps3netsrv","name":"ps3netsrv","desc":"Luci for PS3NETSRV","desc_en":"Luci for PS3NETSRV","cat":"存储","kind":"app","origin":{"type":"builtin"},"deps":["ps3netsrv"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-rclone","name":"rclone","desc":"LuCI support for Rclone","desc_en":"LuCI support for Rclone","cat":"存储","kind":"app","origin":{"type":"builtin"},"deps":["rclone-config","PACKAGE_$(PKG_NAME)_INCLUDE_rclone-webui:rclone-webui-react","PACKAGE_$(PKG_NAME)_INCLUDE_rclone-ng:rclone-ng"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-samba4","name":"网络共享","desc":"局域网内共享硬盘文件夹。","desc_en":"Network Shares - Samba 4 SMB/CIFS fileserver","cat":"存储","kind":"app","origin":{"type":"builtin"},"deps":["samba4-server"],"requires":[],"size_mb":2.5,"rec":false,"tut":"先挂载硬盘，再添加共享目录。","tags":[],"hidden":false},{"id":"luci-app-syncthing","name":"syncthing","desc":"LuCI support for syncthing","desc_en":"LuCI support for syncthing","cat":"存储","kind":"app","origin":{"type":"builtin"},"deps":["syncthing"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-usb-printer","name":"usb-printer","desc":"USB Printer Share via TCP/IP","desc_en":"USB Printer Share via TCP/IP","cat":"存储","kind":"app","origin":{"type":"builtin"},"deps":["p910nd","kmod-usb-printer"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-vsftpd","name":"vsftpd","desc":"LuCI support for VSFTPD","desc_en":"LuCI support for VSFTPD","cat":"存储","kind":"app","origin":{"type":"builtin"},"deps":["vsftpd"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-amule","name":"amule","desc":"LuCI support for Amule","desc_en":"LuCI support for Amule","cat":"下载","kind":"app","origin":{"type":"builtin"},"deps":["amule"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-aria2","name":"Aria2","desc":"轻量多线程下载，可配合网页界面。","desc_en":"LuCI Support for Aria2","cat":"下载","kind":"app","origin":{"type":"builtin"},"deps":["aria2","ariang"],"requires":[],"size_mb":1.5,"rec":false,"tut":"设置下载目录后即可使用。","tags":[],"hidden":false},{"id":"luci-app-qbittorrent","name":"qBittorrent","desc":"功能完整的 BT 下载客户端。","desc_en":"LuCI app for qBittorrent","cat":"下载","kind":"app","origin":{"type":"builtin"},"deps":["qbittorrent-enhanced-edition"],"requires":[],"size_mb":6,"rec":false,"tut":"默认端口 8080，请修改初始密码。","tags":[],"hidden":false},{"id":"luci-app-transmission","name":"Transmission","desc":"LuCI Support for Transmission","desc_en":"LuCI Support for Transmission","cat":"下载","kind":"app","origin":{"type":"builtin"},"deps":["transmission-cli","transmission-daemon","transmission-remote","transmission-web-control"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-docker","name":"docker","desc":"Luci for Docker-CE","desc_en":"Luci for Docker-CE","cat":"容器","kind":"app","origin":{"type":"builtin"},"deps":["docker","dockerd","e2fsprogs","fdisk"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-dockerman","name":"dockerman","desc":"运行容器，体积和内存占用都较大。","desc_en":"LuCI Support for docker","cat":"容器","kind":"app","origin":{"type":"builtin"},"deps":["luci-lib-docker","luci-lib-ip","docker","dockerd","docker-compose","ttyd"],"requires":[],"size_mb":30,"rec":false,"tut":"需要外接存储，空间小的设备不建议。","tags":[],"hidden":false},{"id":"luci-app-lxc","name":"lxc","desc":"LXC management Web UI","desc_en":"LXC management Web UI","cat":"容器","kind":"app","origin":{"type":"builtin"},"deps":["lxc","lxc-attach","lxc-console","lxc-create","liblxc","rpcd-mod-lxc","getopt","!LXC_BUSYBOX_OPTIONS:tar"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-babeld","name":"Babeld","desc":"LuCI support for babeld","desc_en":"LuCI support for babeld","cat":"监控","kind":"app","origin":{"type":"builtin"},"deps":["babeld"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-cpulimit","name":"cpulimit","desc":"cpulimit configuration module","desc_en":"cpulimit configuration module","cat":"监控","kind":"app","origin":{"type":"builtin"},"deps":["cpulimit"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-cshark","name":"cshark","desc":"Cloudshark capture tool Web UI","desc_en":"Cloudshark capture tool Web UI","cat":"监控","kind":"app","origin":{"type":"builtin"},"deps":["cshark"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-netdata","name":"Netdata","desc":"实时查看 CPU、流量、温度曲线。","desc_en":"LuCI support for Netdata","cat":"监控","kind":"app","origin":{"type":"builtin"},"deps":["netdata"],"requires":[],"size_mb":5,"rec":false,"tut":"打开 19999 端口查看仪表盘。","tags":[],"hidden":false},{"id":"luci-app-nlbwmon","name":"带宽监控","desc":"Netlink based bandwidth accounting","desc_en":"Netlink based bandwidth accounting","cat":"监控","kind":"app","origin":{"type":"builtin"},"deps":["luci-lib-chartjs","nlbwmon"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-softether","name":"SoftEther Status","desc":"Softether management application","desc_en":"Softether management application","cat":"监控","kind":"app","origin":{"type":"builtin"},"deps":["softethervpn5-client"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-statistics","name":"statistics","desc":"LuCI Statistics Application","desc_en":"LuCI Statistics Application","cat":"监控","kind":"app","origin":{"type":"builtin"},"deps":["collectd","rrdtool1","collectd-mod-rrdtool","collectd-mod-iwinfo","collectd-mod-cpu","collectd-mod-memory","collectd-mod-interface","collectd-mod-load","collectd-mod-network"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-vnstat2","name":"流量监控器","desc":"LuCI Support for vnStat 2","desc_en":"LuCI Support for vnStat 2","cat":"监控","kind":"app","origin":{"type":"builtin"},"deps":["luci-lib-jsonc","vnstat2","vnstati2"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-airplay2","name":"airplay2","desc":"Luci for Apple Airplay2 Receiver","desc_en":"Luci for Apple Airplay2 Receiver","cat":"多媒体","kind":"app","origin":{"type":"builtin"},"deps":["alsa-utils","shairport-sync-openssl"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-music-remote-center","name":"music-remote-center","desc":"Luci for Music Remote Center","desc_en":"Luci for Music Remote Center","cat":"多媒体","kind":"app","origin":{"type":"builtin"},"deps":["alsa-utils","owntone"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-oscam","name":"Content-Type: text/plain; charset=UTF-8\\n","desc":"LuCI Support for oscam","desc_en":"LuCI Support for oscam","cat":"多媒体","kind":"app","origin":{"type":"builtin"},"deps":["oscam"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-unblockneteasemusic","name":"解除网易云音乐播放限制","desc":"解除网易云音乐的播放限制。","desc_en":"LuCI support for UnblockNeteaseMusic (JavaScript)","cat":"多媒体","kind":"app","origin":{"type":"builtin"},"deps":["dnsmasq-full","firewall4","node"],"requires":[],"size_mb":2.8,"rec":false,"tut":"启用后按说明设置设备代理。","tags":[],"hidden":false},{"id":"luci-app-upnp","name":"UPnP IGD 和 PCP","desc":"让下载、游戏程序自动开放端口。","desc_en":"UPnP IGD & PCP/NAT-PMP configuration module","cat":"多媒体","kind":"app","origin":{"type":"builtin"},"deps":["miniupnpd","rpcd-mod-ucode"],"requires":[],"size_mb":0.1,"rec":false,"tut":"勾选启用即可，注意安全风险。","tags":[],"hidden":false},{"id":"luci-app-acl","name":"ACL 设置","desc":"LuCI account management module","desc_en":"LuCI account management module","cat":"系统","kind":"app","origin":{"type":"builtin"},"deps":[],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-advanced-reboot","name":"高级重启","desc":"Advanced Linksys Reboot Web UI","desc_en":"Advanced Linksys Reboot Web UI","cat":"系统","kind":"app","origin":{"type":"builtin"},"deps":["jshn"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-argon-config","name":"Argon 主题设置","desc":"LuCI for Argon theme configuration","desc_en":"LuCI for Argon theme configuration","cat":"系统","kind":"app","origin":{"type":"builtin"},"deps":["luci-theme-argon"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-attendedsysupgrade","name":"值守式系统升级","desc":"LuCI support for attended sysupgrades","desc_en":"LuCI support for attended sysupgrades","cat":"系统","kind":"app","origin":{"type":"builtin"},"deps":["attendedsysupgrade-common","cgi-io"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-autoreboot","name":"定时重启","desc":"按计划自动重启，保持稳定。","desc_en":"LuCI support for Scheduled Reboot","cat":"系统","kind":"app","origin":{"type":"builtin"},"deps":[],"requires":[],"size_mb":0.05,"rec":false,"tut":"设置每天或每周的重启时间。","tags":[],"hidden":false},{"id":"luci-app-commands","name":"自定义命令","desc":"LuCI Shell Command Module","desc_en":"LuCI Shell Command Module","cat":"系统","kind":"app","origin":{"type":"builtin"},"deps":[],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-cpufreq","name":"CPU 性能优化调节","desc":"LuCI for CPU Freq Setting","desc_en":"LuCI for CPU Freq Setting","cat":"系统","kind":"app","origin":{"type":"builtin"},"deps":["cpufreq"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-crowdsec-firewall-bouncer","name":"crowdsec-firewall-bouncer","desc":"CrowdSec firewall bouncer LuCI interface","desc_en":"CrowdSec firewall bouncer LuCI interface","cat":"系统","kind":"app","origin":{"type":"builtin"},"deps":["crowdsec-firewall-bouncer"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-example","name":"example","desc":"LuCI example app for js based luci","desc_en":"LuCI example app for js based luci","cat":"系统","kind":"app","origin":{"type":"builtin"},"deps":[],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-filebrowser","name":"文件浏览器","desc":"LuCI File Browser module","desc_en":"LuCI File Browser module","cat":"系统","kind":"app","origin":{"type":"builtin"},"deps":[],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-filemanager","name":"文件管理器","desc":"LuCI File Manager module","desc_en":"LuCI File Manager module","cat":"系统","kind":"app","origin":{"type":"builtin"},"deps":[],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-firewall","name":"防火墙","desc":"Firewall and port forwarding application","desc_en":"Firewall and port forwarding application","cat":"系统","kind":"app","origin":{"type":"builtin"},"deps":["uci-firewall"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-k3screenctrl","name":"Content-Type: text/plain; charset=UTF-8\\n","desc":"LuCI Support for k3screenctrl","desc_en":"LuCI Support for k3screenctrl","cat":"系统","kind":"app","origin":{"type":"builtin"},"deps":["phicomm-k3screenctrl"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-ledtrig-rssi","name":"ledtrig-rssi","desc":"LuCI Support for ledtrigger rssi","desc_en":"LuCI Support for ledtrigger rssi","cat":"系统","kind":"app","origin":{"type":"builtin"},"deps":["rssileds"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-ledtrig-switch","name":"ledtrig-switch","desc":"LuCI Support for ledtrigger switch","desc_en":"LuCI Support for ledtrigger switch","cat":"系统","kind":"app","origin":{"type":"builtin"},"deps":[],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-ledtrig-usbport","name":"ledtrig-usbport","desc":"LuCI Support for ledtrigger usbport","desc_en":"LuCI Support for ledtrigger usbport","cat":"系统","kind":"app","origin":{"type":"builtin"},"deps":["kmod-usb-ledtrig-usbport"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-ltqtapi","name":"ltqtapi","desc":"LuCI Support for Lantiq Devices","desc_en":"LuCI Support for Lantiq Devices","cat":"系统","kind":"app","origin":{"type":"builtin"},"deps":[],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-oled","name":"Content-Type: text/plain; charset=UTF-8","desc":"","desc_en":"","cat":"系统","kind":"app","origin":{"type":"builtin"},"deps":["i2c-tools","libconfig"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-package-manager","name":"软件包","desc":"Package management application","desc_en":"Package management application","cat":"系统","kind":"app","origin":{"type":"builtin"},"deps":[],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-ramfree","name":"释放内存","desc":"LuCI support for RAM free","desc_en":"LuCI support for RAM free","cat":"系统","kind":"app","origin":{"type":"builtin"},"deps":[],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-splash","name":"splash","desc":"Freifunk DHCP-Splash application","desc_en":"Freifunk DHCP-Splash application","cat":"系统","kind":"app","origin":{"type":"builtin"},"deps":["luci-lib-nixio","luci-lib-iptparser","luci-lua-runtime","tc","kmod-sched","iptables-mod-nat-extra","iptables-mod-ipopt"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-store","name":"iStore 软件中心","desc":"固件只带基础功能，装机后在路由器里按需安装更多插件，大幅减小固件。","desc_en":"","cat":"系统","kind":"app","origin":{"type":"feed","name":"istore","line":"src-git istore https://github.com/linkease/istore;main"},"deps":[],"requires":["luci-compat"],"size_mb":0.6,"rec":true,"tut":"进入「系统 → 软件中心」，每个应用都附带教程。","tags":[],"hidden":false},{"id":"luci-app-ttyd","name":"终端","desc":"在浏览器里直接打开路由器命令行。","desc_en":"ttyd - Command-line tool for sharing terminal over the web","cat":"系统","kind":"app","origin":{"type":"builtin"},"deps":["ttyd"],"requires":[],"size_mb":0.3,"rec":false,"tut":"进入「系统 → 终端」。","tags":[],"hidden":false},{"id":"luci-app-uhttpd","name":"uHTTPd","desc":"uHTTPd Webserver Configuration","desc_en":"uHTTPd Webserver Configuration","cat":"系统","kind":"app","origin":{"type":"builtin"},"deps":["uhttpd"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-app-watchcat","name":"Watchcat","desc":"LuCI Support for Watchcat","desc_en":"LuCI Support for Watchcat","cat":"系统","kind":"app","origin":{"type":"builtin"},"deps":["watchcat"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-proto-3g","name":"3g","desc":"Support for 3G","desc_en":"Support for 3G","cat":"协议","kind":"proto","origin":{"type":"builtin"},"deps":["comgt"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-proto-autoip","name":"autoip","desc":"Support for Avahi IPv4LL configuration","desc_en":"Support for Avahi IPv4LL configuration","cat":"协议","kind":"proto","origin":{"type":"builtin"},"deps":["avahi-autoipd"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-proto-batman-adv","name":"batman-adv","desc":"Support for the batman-adv protocol","desc_en":"Support for the batman-adv protocol","cat":"协议","kind":"proto","origin":{"type":"builtin"},"deps":["kmod-batman-adv"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-proto-external","name":"external","desc":"Support for externally managed protocol","desc_en":"Support for externally managed protocol","cat":"协议","kind":"proto","origin":{"type":"builtin"},"deps":["external-protocol"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-proto-gre","name":"gre","desc":"Support for GRE tunnels (RFC2784)","desc_en":"Support for GRE tunnels (RFC2784)","cat":"协议","kind":"proto","origin":{"type":"builtin"},"deps":["gre"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-proto-hnet","name":"hnet","desc":"Support for hnet","desc_en":"Support for hnet","cat":"协议","kind":"proto","origin":{"type":"builtin"},"deps":[],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-proto-ipip","name":"ipip","desc":"Support for IPIP tunnels (IPv4-in-IPv4 RFC2003)","desc_en":"Support for IPIP tunnels (IPv4-in-IPv4 RFC2003)","cat":"协议","kind":"proto","origin":{"type":"builtin"},"deps":["ipip"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-proto-ipv6","name":"ipv6","desc":"Support for DHCPv6/6in4/6to4/6rd/DS-Lite/IPIP6","desc_en":"Support for DHCPv6/6in4/6to4/6rd/DS-Lite/IPIP6","cat":"协议","kind":"proto","origin":{"type":"builtin"},"deps":[],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-proto-mbim","name":"mbim","desc":"Support for MBIM","desc_en":"Support for MBIM","cat":"协议","kind":"proto","origin":{"type":"builtin"},"deps":["umbim"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-proto-minieap","name":"Content-Type: text/plain; charset=UTF-8","desc":"LuCI support for MiniEAP","desc_en":"LuCI support for MiniEAP","cat":"协议","kind":"proto","origin":{"type":"builtin"},"deps":["minieap"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-proto-modemmanager","name":"Cellular Network","desc":"Support for ModemManager","desc_en":"Support for ModemManager","cat":"协议","kind":"proto","origin":{"type":"builtin"},"deps":["modemmanager"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-proto-ncm","name":"ncm","desc":"Support for NCM","desc_en":"Support for NCM","cat":"协议","kind":"proto","origin":{"type":"builtin"},"deps":["comgt-ncm"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-proto-nebula","name":"nebula","desc":"Support for Nebula","desc_en":"Support for Nebula","cat":"协议","kind":"proto","origin":{"type":"builtin"},"deps":["nebula","nebula-proto"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-proto-openconnect","name":"openconnect","desc":"Support for OpenConnect VPN","desc_en":"Support for OpenConnect VPN","cat":"协议","kind":"proto","origin":{"type":"builtin"},"deps":["openconnect"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-proto-openfortivpn","name":"openfortivpn","desc":"Support for OpenFortivpn","desc_en":"Support for OpenFortivpn","cat":"协议","kind":"proto","origin":{"type":"builtin"},"deps":["openfortivpn"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-proto-ppp","name":"ppp","desc":"Support for PPP/PPPoE/PPPoA/PPtP","desc_en":"Support for PPP/PPPoE/PPPoA/PPtP","cat":"协议","kind":"proto","origin":{"type":"builtin"},"deps":[],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-proto-pppossh","name":"pppossh","desc":"Support for pppossh","desc_en":"Support for pppossh","cat":"协议","kind":"proto","origin":{"type":"builtin"},"deps":["pppossh"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-proto-qmi","name":"qmi","desc":"Support for QMI","desc_en":"Support for QMI","cat":"协议","kind":"proto","origin":{"type":"builtin"},"deps":["uqmi"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-proto-quectel","name":"quectel","desc":"Support for Quectel WWAN modules","desc_en":"Support for Quectel WWAN modules","cat":"协议","kind":"proto","origin":{"type":"builtin"},"deps":["quectel-cm"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-proto-relay","name":"relay","desc":"Support for relayd pseudo bridges","desc_en":"Support for relayd pseudo bridges","cat":"协议","kind":"proto","origin":{"type":"builtin"},"deps":["relayd"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-proto-sstp","name":"sstp","desc":"Support for SSTP","desc_en":"Support for SSTP","cat":"协议","kind":"proto","origin":{"type":"builtin"},"deps":["sstp-client"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-proto-unet","name":"unet","desc":"Support for unetd VPN","desc_en":"Support for unetd VPN","cat":"协议","kind":"proto","origin":{"type":"builtin"},"deps":["unetd","unet-cli"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-proto-vpnc","name":"vpnc","desc":"Support for VPNC VPN","desc_en":"Support for VPNC VPN","cat":"协议","kind":"proto","origin":{"type":"builtin"},"deps":["vpnc"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-proto-vti","name":"vti","desc":"Support for VTI interfaces","desc_en":"Support for VTI interfaces","cat":"协议","kind":"proto","origin":{"type":"builtin"},"deps":["vti"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-proto-vxlan","name":"vxlan","desc":"Support for Virtual eXtensible Local Area Network (VXLAN, RFC7348)","desc_en":"Support for Virtual eXtensible Local Area Network (VXLAN, RFC7348)","cat":"协议","kind":"proto","origin":{"type":"builtin"},"deps":["vxlan","ip-bridge"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-proto-wireguard","name":"WireGuard","desc":"在外也能安全回家访问内网。","desc_en":"Support for WireGuard VPN","cat":"协议","kind":"proto","origin":{"type":"builtin"},"deps":["wireguard-tools","ucode","luci-lib-uqr","resolveip"],"requires":[],"size_mb":0.1,"rec":false,"tut":"「网络 → 接口」新增 WireGuard 协议。","tags":[],"hidden":false},{"id":"luci-proto-xfrm","name":"xfrm","desc":"Support for XFRM interfaces","desc_en":"Support for XFRM interfaces","cat":"协议","kind":"proto","origin":{"type":"builtin"},"deps":["xfrm"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-proto-yggdrasil","name":"yggdrasil","desc":"Support for Yggdrasil Network","desc_en":"Support for Yggdrasil Network","cat":"协议","kind":"proto","origin":{"type":"builtin"},"deps":["yggdrasil"],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-theme-argon","name":"argon","desc":"清爽的深浅色自适应界面。","desc_en":"Argon Theme","cat":"主题","kind":"theme","origin":{"type":"builtin"},"deps":["wget","jsonfilter"],"requires":[],"size_mb":0.6,"rec":false,"tut":"在「系统 → 主题」切换。","tags":[],"hidden":false},{"id":"luci-theme-bootstrap","name":"bootstrap","desc":"Bootstrap Theme (default)","desc_en":"Bootstrap Theme (default)","cat":"主题","kind":"theme","origin":{"type":"builtin"},"deps":[],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-theme-material","name":"material","desc":"Material Theme","desc_en":"Material Theme","cat":"主题","kind":"theme","origin":{"type":"builtin"},"deps":[],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-theme-openwrt","name":"openwrt","desc":"LuCI OpenWrt.org theme","desc_en":"LuCI OpenWrt.org theme","cat":"主题","kind":"theme","origin":{"type":"builtin"},"deps":[],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false},{"id":"luci-theme-openwrt-2020","name":"openwrt-2020","desc":"LuCI modern OpenWrt theme","desc_en":"LuCI modern OpenWrt theme","cat":"主题","kind":"theme","origin":{"type":"builtin"},"deps":[],"requires":[],"size_mb":null,"rec":false,"tut":"","tags":[],"hidden":false}]}/*CATALOG:END*/;
+
+  let _schemaOk = false;
+  async function ensureSchema(env) {
+    if (_schemaOk) return;
+    const ddl = [
+      `CREATE TABLE IF NOT EXISTS templates (id TEXT PRIMARY KEY, name TEXT, repo_url TEXT, branch TEXT, target TEXT, plugins TEXT, diy_script_1 TEXT, diy_script_2 TEXT, dotconfig_version_id TEXT, schedule_cron TEXT, schedule_enabled INTEGER DEFAULT 0, schedule_dotconfig_version_id TEXT, created_at INTEGER, updated_at INTEGER)`,
+      `CREATE TABLE IF NOT EXISTS dotconfig_history (id TEXT PRIMARY KEY, template_id TEXT NOT NULL, content TEXT NOT NULL, source TEXT NOT NULL, build_id TEXT, label TEXT, created_at INTEGER)`,
+      `CREATE TABLE IF NOT EXISTS builds (id TEXT PRIMARY KEY, template_id TEXT, repo_url TEXT, branch TEXT, target TEXT, plugins TEXT, diy_script_1 TEXT, diy_script_2 TEXT, dotconfig_version_id TEXT, dotconfig_snapshot TEXT, dotconfig_result TEXT, trigger_type TEXT DEFAULT 'manual', schedule_cron TEXT, status TEXT, web_url TEXT, download_url TEXT, github_run_id TEXT, created_at INTEGER, updated_at INTEGER)`,
+      `CREATE TABLE IF NOT EXISTS system_config (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
+      `CREATE TABLE IF NOT EXISTS cache_kv (key TEXT PRIMARY KEY, value TEXT NOT NULL, expires INTEGER NOT NULL)`,
+    ];
+    const alters = [
+      'ALTER TABLE templates ADD COLUMN profile TEXT',
+      'ALTER TABLE templates ADD COLUMN selection TEXT',
+      'ALTER TABLE templates ADD COLUMN project_id TEXT',
+      'ALTER TABLE templates ADD COLUMN menuconfig INTEGER DEFAULT 0',
+      'ALTER TABLE templates ADD COLUMN pin_dotconfig_version_id TEXT',
+      'UPDATE templates SET pin_dotconfig_version_id = schedule_dotconfig_version_id WHERE pin_dotconfig_version_id IS NULL AND schedule_dotconfig_version_id IS NOT NULL',
+      "ALTER TABLE templates ADD COLUMN packages TEXT DEFAULT '[]'",
+      'ALTER TABLE builds ADD COLUMN profile TEXT',
+      "ALTER TABLE builds ADD COLUMN packages TEXT DEFAULT '[]'",
+      'ALTER TABLE builds ADD COLUMN menuconfig INTEGER DEFAULT 1',
+      'ALTER TABLE builds ADD COLUMN fail_reason TEXT',
+      'ALTER TABLE builds ADD COLUMN log_tail TEXT',
+      'ALTER TABLE builds ADD COLUMN github_run_id TEXT',
+    ];
+    for (const q of ddl) await env.DB.prepare(q).run();
+    for (const q of alters) { try { await env.DB.prepare(q).run(); } catch (e) { /* 列已存在 */ } }
+    _schemaOk = true;
+  }
+
+  const PKG_RE = /^[A-Za-z0-9_.+-]+$/;  // 清单会被写进 .config，必须校验
+
+  // ---------- 项目（源码）与机型：Worker 运行时直接从源码仓库读取 ----------
+  const PROJECT_ID_RE = /^[a-z0-9][a-z0-9._-]*$/;
+  const SEG_RE = /^[A-Za-z0-9_+-][A-Za-z0-9_.+-]*$/;   // 平台 / 子平台目录名，不允许以 . 开头
+  const TARGET_RE = /^[A-Za-z0-9_+-][A-Za-z0-9_.+-]*\/[A-Za-z0-9_+-][A-Za-z0-9_.+-]*$/;
+  const BRANCH_RE = /^[A-Za-z0-9._\/-]+$/;
+  const SRC_CACHE_TTL = 7 * 24 * 3600 * 1000;
+
+  function parseGithubUrl(u) {
+    const m = /^https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?\/?$/.exec(u || '');
+    return m ? { owner: m[1], repo: m[2] } : null;
+  }
+
+  async function cacheGet(env, key) {
+    const r = await env.DB.prepare('SELECT value, expires FROM cache_kv WHERE key = ?').bind(key).first();
+    if (!r || r.expires < Date.now()) return null;
+    try { return JSON.parse(r.value); } catch (e) { return null; }
+  }
+  async function cacheSet(env, key, val) {
+    await env.DB.prepare('INSERT INTO cache_kv (key, value, expires) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, expires = excluded.expires')
+      .bind(key, JSON.stringify(val), Date.now() + SRC_CACHE_TTL).run();
+  }
+
+  // 目录列表走 GitHub contents API。无令牌时每个 IP 每小时只有 60 次且是共享出口，所以带上部署时配置的 token
+  async function ghList(env, gh, branch, path) {
+    const token = await getConfig(env, 'github_token');
+    const headers = { Accept: 'application/vnd.github+json', 'User-Agent': 'openwrt-auto-build-worker' };
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const url = `https://api.github.com/repos/${gh.owner}/${gh.repo}/contents/${path.split('/').map(encodeURIComponent).join('/')}?ref=${encodeURIComponent(branch)}`;
+    const r = await fetch(url, { headers });
+    if (r.status === 404) throw new Error(`仓库里没有 ${path}，请确认仓库地址和分支正确、仓库是公开的，并且是 OpenWrt 系源码`);
+    if (r.status === 403 || r.status === 429) throw new Error('GitHub API 请求受限，请稍后再试（已配置 token 时一般不会出现）');
+    if (!r.ok) throw new Error(`GitHub API 错误 ${r.status}`);
+    const j = await r.json();
+    if (!Array.isArray(j)) throw new Error(`${path} 不是目录`);
+    return j.map((e) => ({ name: String(e.name), type: String(e.type) }));
+  }
+  async function rawText(gh, branch, path) {
+    const enc = (s) => s.split('/').map(encodeURIComponent).join('/');
+    const r = await fetch(`https://raw.githubusercontent.com/${gh.owner}/${gh.repo}/${enc(branch)}/${enc(path)}`);
+    return r.ok ? await r.text() : '';
+  }
+
+  // ---- 解析 target/linux/<平台>/image/*.mk 里的 define Device/<id> 与 TARGET_DEVICES ----
+  function mkVar(text, name) {
+    const m = new RegExp('^' + name + '\\s*:?=\\s*(.*)$', 'm').exec(text);
+    return m ? m[1].trim() : '';
+  }
+  function cleanVal(s) { return s.replace(/\$\([^)]*\)/g, '').replace(/\s+/g, ' ').trim(); }
+  function matchSubtargets(stem, subs) {
+    if (subs.includes(stem)) return [stem];
+    const pre = stem.split(/[-_.]/)[0];
+    if (subs.includes(pre)) return [pre];
+    return subs.slice();
+  }
+  function parseDevices(files, subs) {
+    const raw = {}, local = {};   // local：按文件区分，同名机型在不同文件里可能有不同定义（如 x86 的 generic）
+    for (const f of files) {
+      const t = f.text.replace(/\\\n/g, ' ');
+      const re = /^define Device\/(\S+)\n([\s\S]*?)^endef/gm;
+      let m;
+      while ((m = re.exec(t))) { raw[m[1]] = m[2]; (local[f.name] = local[f.name] || {})[m[1]] = m[2]; }
+    }
+    const memo = {};
+    const resolve = (id, ctx, depth) => {
+      const mkey = ctx + '|' + id;
+      if (memo[mkey]) return memo[mkey];
+      const body = (local[ctx] && local[ctx][id] !== undefined) ? local[ctx][id] : (raw[id] || '');
+      const d = {};
+      if (depth < 8) {
+        const pr = /\$\((?:call )?Device\/([^\s)]+)/g;
+        let pm;
+        while ((pm = pr.exec(body))) {
+          if (pm[1] !== id && raw[pm[1]] !== undefined) {
+            const pd = resolve(pm[1], ctx, depth + 1);
+            for (const k of Object.keys(pd)) if (pd[k]) d[k] = pd[k];
+          }
+        }
+      }
+      const vr = /^\s*(DEVICE_(?:VENDOR|MODEL|VARIANT|ALT\d+_VENDOR|ALT\d+_MODEL|ALT\d+_VARIANT))\s*:?=\s*(.*)$/gm;
+      let vm;
+      while ((vm = vr.exec(body))) d[vm[1]] = cleanVal(vm[2]);
+      memo[mkey] = d;
+      return d;
+    };
+    const names = (d, fallback) => {
+      const main = [d.DEVICE_VENDOR, d.DEVICE_MODEL, d.DEVICE_VARIANT].filter(Boolean).join(' ') || fallback;
+      const alts = [];
+      for (const k of Object.keys(d).sort()) {
+        const mm = /^DEVICE_ALT(\d+)_MODEL$/.exec(k);
+        if (mm && d[k]) {
+          const a = [d['DEVICE_ALT' + mm[1] + '_VENDOR'], d[k], d['DEVICE_ALT' + mm[1] + '_VARIANT']].filter(Boolean).join(' ');
+          if (a && a !== main) alts.push(a);
+        }
+      }
+      return [main, alts];
+    };
+    const per = {};
+    for (const s of subs) per[s] = {};
+    for (const f of files) {
+      const stem = f.name.replace(/\.mk$/, '');
+      const ids = [];
+      const tr = /^TARGET_DEVICES\s*\+?=\s*(.*)$/gm;
+      let tm;
+      const joined = f.text.replace(/\\\n/g, ' ');
+      while ((tm = tr.exec(joined))) for (const x of tm[1].split(/\s+/)) if (/^[A-Za-z0-9_.+-]+$/.test(x)) ids.push(x);
+      for (const s of matchSubtargets(stem, subs)) {
+        for (const id of ids) {
+          const [name, alt] = names(resolve(id, f.name, 0), id);
+          per[s][id] = { id, name: name.slice(0, 120), alt: alt.slice(0, 6).map((a) => a.slice(0, 120)) };
+        }
+      }
+    }
+    return per;
+  }
+
+  async function allProjects(env) {
+    const cat = await loadCatalog(env, false);
+    const built = cat.sources.map((s) => ({ id: s.id, name: `${s.name} · ${s.branch}`, repo_url: s.repo_url, branch: s.branch, builtin: true }));
+    const custom = (await getCustomProjects(env)).map((p) => ({ ...p, builtin: false }));
+    return built.concat(custom);
+  }
+  async function getCustomProjects(env) {
+    const raw = await getConfig(env, 'custom_projects');
+    try { const a = JSON.parse(raw || '[]'); return Array.isArray(a) ? a : []; } catch (e) { return []; }
+  }
+  async function projectIdFor(url, branch) {
+    const buf = await crypto.subtle.digest('SHA-1', new TextEncoder().encode(url + '#' + branch));
+    return 'custom-' + Array.from(new Uint8Array(buf)).slice(0, 4).map((b) => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  async function handleListProjects(env) {
+    return json({ projects: await allProjects(env) });
+  }
+
+  async function handleCreateProject(request, env) {
+    const body = await request.json().catch(() => null);
+    if (!body) return err('请求格式错误');
+    const name = String(body.name || '').trim().slice(0, 40);
+    const repo_url = String(body.repo_url || '').trim().replace(/\/+$/, '');
+    const branch = String(body.branch || '').trim();
+    if (!name) return err('请填写项目名称');
+    const gh = parseGithubUrl(repo_url);
+    if (!gh || repo_url.length > 200) return err('仓库地址格式应为 https://github.com/用户/仓库（目前仅支持 GitHub 仓库）');
+    if (!BRANCH_RE.test(branch) || branch.length > 100) return err('分支名只能包含字母、数字和 . _ / -');
+    try { await ghList(env, gh, branch, 'target/linux'); } catch (e) { return err(e.message); }
+    const list = await getCustomProjects(env);
+    const id = await projectIdFor(repo_url, branch);
+    if (!list.find((p) => p.id === id)) {
+      if (list.length >= 20) return err('自定义项目最多 20 个');
+      list.push({ id, name, repo_url, branch, created_at: now() });
+      await setConfig(env, 'custom_projects', JSON.stringify(list));
+    }
+    return json({ project: { ...list.find((p) => p.id === id), builtin: false } }, 201);
+  }
+
+  async function handleDeleteProject(env, id) {
+    const list = await getCustomProjects(env);
+    if (!list.find((p) => p.id === id)) return err('只能删除自定义项目', 404);
+    await setConfig(env, 'custom_projects', JSON.stringify(list.filter((p) => p.id !== id)));
+    return json({ ok: true });
+  }
+
+  async function projectSource(env, pid) {
+    if (!PROJECT_ID_RE.test(pid || '')) return { error: err('project 参数非法') };
+    const proj = (await allProjects(env)).find((p) => p.id === pid);
+    if (!proj) return { error: err('项目不存在', 404) };
+    const gh = parseGithubUrl(proj.repo_url);
+    if (!gh) return { error: err('目前仅支持从 GitHub 仓库读取平台和机型，请手动填写') };
+    return { proj, gh, tag: `${gh.owner}/${gh.repo}@${proj.branch}` };
+  }
+
+  // 平台列表：读取 target/linux 目录（1 次 API 调用，缓存 7 天）
+  async function handlePlatforms(env, url) {
+    const ps = await projectSource(env, url.searchParams.get('project'));
+    if (ps.error) return ps.error;
+    const force = url.searchParams.get('refresh') === '1';
+    const key = `plat:${ps.tag}`;
+    if (!force) { const c = await cacheGet(env, key); if (c) return json({ ...c, source: 'cache' }); }
+    let entries;
+    try { entries = await ghList(env, ps.gh, ps.proj.branch, 'target/linux'); } catch (e) { return err(e.message, 502); }
+    const platforms = entries.filter((e) => e.type === 'dir' && e.name !== 'generic' && SEG_RE.test(e.name)).map((e) => ({ id: e.name }));
+    if (!platforms.length) return err('没有找到任何平台，请确认这是 OpenWrt 系源码仓库', 404);
+    const data = { project: ps.proj.id, platforms, fetched_at: new Date().toISOString().slice(0, 10) };
+    await cacheSet(env, key, data);
+    return json({ ...data, source: 'github' });
+  }
+
+  // 单个平台：子平台 + 各子平台的机型（读取该平台的 Makefile、image 目录下的 *.mk，缓存 7 天）
+  async function handlePlatform(env, url) {
+    const ps = await projectSource(env, url.searchParams.get('project'));
+    if (ps.error) return ps.error;
+    const target = url.searchParams.get('target') || '';
+    if (!SEG_RE.test(target)) return err('target 参数非法');
+    const force = url.searchParams.get('refresh') === '1';
+    const key = `dev:${ps.tag}:${target}`;
+    if (!force) { const c = await cacheGet(env, key); if (c) return json({ ...c, source: 'cache' }); }
+    const br = ps.proj.branch, base = `target/linux/${target}`;
+    const mk = await rawText(ps.gh, br, `${base}/Makefile`);
+    if (!mkVar(mk, 'BOARD')) return err(`${target} 不是有效的平台`, 404);
+    const subs = (mkVar(mk, 'SUBTARGETS').split(/\s+/).filter((s) => SEG_RE.test(s)));
+    if (!subs.length) subs.push('generic');
+    let listing;
+    try { listing = await ghList(env, ps.gh, br, `${base}/image`); } catch (e) { return err(e.message, 502); }
+    const names = listing.filter((e) => e.type === 'file' && (e.name === 'Makefile' || /^[A-Za-z0-9_.+-]+\.mk$/.test(e.name))).map((e) => e.name).slice(0, 45);
+    const files = await Promise.all(names.map(async (n) => ({ name: n, text: await rawText(ps.gh, br, `${base}/image/${n}`) })));
+    const subMk = await Promise.all(subs.slice(0, 10).map((s) => rawText(ps.gh, br, `${base}/${s}/target.mk`)));
+    const per = parseDevices(files, subs);
+    const subtargets = [];
+    subs.forEach((s, i) => {
+      const devices = Object.values(per[s]).sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
+      if (!devices.length) return;
+      const st = subMk[i] || '';
+      const board = cleanVal(mkVar(st, 'BOARDNAME') || mkVar(mk, 'BOARDNAME') || s);
+      const arch = [mkVar(st, 'ARCH') || mkVar(mk, 'ARCH'), mkVar(st, 'CPU_TYPE') || mkVar(mk, 'CPU_TYPE')].filter(Boolean).join('/');
+      subtargets.push({ id: s, name: board.slice(0, 120), arch: arch.slice(0, 60), devices });
+    });
+    if (!subtargets.length) return err(`${target} 下没有解析到机型`, 404);
+    const data = { project: ps.proj.id, id: target, name: cleanVal(mkVar(mk, 'BOARDNAME')).slice(0, 120), subtargets, fetched_at: new Date().toISOString().slice(0, 10) };
+    await cacheSet(env, key, data);
+    return json({ ...data, source: 'github' });
+  }
+
+  // ---------- 自定义插件：用户填写插件仓库地址，保存后和目录里的插件一起出现在商店 ----------
+  const CUSTOM_PLUGIN_MAX = 40;
+  async function getCustomPlugins(env) {
+    const raw = await getConfig(env, 'custom_plugins');
+    try { const a = JSON.parse(raw || '[]'); return Array.isArray(a) ? a : []; } catch (e) { return []; }
+  }
+  async function ghJson(env, path) {
+    const token = await getConfig(env, 'github_token');
+    const headers = { Accept: 'application/vnd.github+json', 'User-Agent': 'openwrt-auto-build-worker' };
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const r = await fetch('https://api.github.com' + path, { headers });
+    if (r.status === 404) throw new Error('仓库或分支不存在（需要是公开仓库）');
+    if (r.status === 403 || r.status === 429) throw new Error('GitHub API 请求受限，请稍后再试');
+    if (!r.ok) throw new Error(`GitHub API 错误 ${r.status}`);
+    return r.json();
+  }
+  function cleanRepoUrl(u) { return String(u || '').trim().replace(/\/+$/, '').replace(/\.git$/, ''); }
+  function httpsRepoOk(u) { return u.length <= 300 && /^https:\/\/[A-Za-z0-9.-]+(:\d+)?\/[A-Za-z0-9._~\/%+@-]+$/.test(u); }
+
+  // 自动识别：根目录有 Makefile → 整个仓库就是一个包；否则列出 3 层以内带 Makefile 的子目录，让用户勾选
+  async function handleDetectCustomPlugin(request, env) {
+    const body = await request.json().catch(() => null);
+    if (!body) return err('请求格式错误');
+    const repo_url = cleanRepoUrl(body.repo_url);
+    if (!httpsRepoOk(repo_url)) return err('仓库地址格式应为 https://github.com/用户/仓库');
+    const gh = parseGithubUrl(repo_url);
+    if (!gh) return json({ detected: false, reason: '目前只能自动识别 GitHub 仓库，请手动填写包名' });
+    let branch = String(body.branch || '').trim();
+    if (branch && (!BRANCH_RE.test(branch) || branch.length > 100)) return err('分支名只能包含字母、数字和 . _ / -');
+    try {
+      if (!branch) branch = String((await ghJson(env, `/repos/${gh.owner}/${gh.repo}`)).default_branch || '');
+      if (!branch) return err('读取不到默认分支，请手动填写分支');
+      const tree = await ghJson(env, `/repos/${gh.owner}/${gh.repo}/git/trees/${encodeURIComponent(branch)}?recursive=1`);
+      const dirs = (tree.tree || []).filter((e) => e.type === 'blob' && /(^|\/)Makefile$/.test(e.path)).map((e) => e.path.replace(/\/?Makefile$/, ''));
+      const root = dirs.includes('');
+      let pkg = gh.repo;
+      if (root) {
+        const v = cleanVal(mkVar(await rawText(gh, branch, 'Makefile'), 'PKG_NAME'));
+        if (v && PKG_RE.test(v)) pkg = v;
+      }
+      const candidates = dirs.filter((p) => p && p.split('/').length <= 3 && GIT_DIR_RE.test(p)).slice(0, 300)
+        .map((p) => ({ path: p, id: p.split('/').pop() })).filter((c) => PKG_RE.test(c.id));
+      return json({ detected: true, branch, repo: gh.repo, root, pkg_name: PKG_RE.test(pkg) ? pkg : gh.repo, candidates, truncated: !!tree.truncated });
+    } catch (e) { return err(e.message, 502); }
+  }
+
+  async function handleListCustomPlugins(env) {
+    return json({ plugins: await getCustomPlugins(env) });
+  }
+
+  async function handleCreateCustomPlugin(request, env) {
+    const body = await request.json().catch(() => null);
+    if (!body) return err('请求格式错误');
+    const repo_url = cleanRepoUrl(body.repo_url);
+    if (!httpsRepoOk(repo_url)) return err('仓库地址格式应为 https://github.com/用户/仓库（仅支持 https）');
+    const branch = String(body.branch || '').trim();
+    if (branch && (!BRANCH_RE.test(branch) || branch.length > 100)) return err('分支名只能包含字母、数字和 . _ / -');
+    const requires = sanitizeIds(body.requires, 20);
+    const desc = String(body.desc || '').trim().slice(0, 200);
+    // 两种形态：整个仓库是一个包（id）；或者仓库里的若干子目录各是一个包（dirs）
+    const items = [];
+    if (Array.isArray(body.dirs) && body.dirs.length) {
+      if (body.dirs.length > 20) return err('一次最多添加 20 个子目录');
+      for (const d of body.dirs.map(String)) {
+        if (!GIT_DIR_RE.test(d) || d.length > 200) return err(`子目录非法：${d.slice(0, 60)}`);
+        const id = d.split('/').pop();
+        if (!PKG_RE.test(id)) return err(`子目录名非法：${id.slice(0, 60)}`);
+        items.push({ id, origin: { type: 'git', name: id, url: repo_url, branch, sparse: true, dirs: [d] } });
+      }
+    } else {
+      const id = String(body.id || '').trim();
+      if (!PKG_RE.test(id)) return err('请填写包名（只能包含字母、数字和 . _ + -）');
+      items.push({ id, origin: { type: 'git', name: id, url: repo_url, branch, sparse: false, dirs: [] } });
+    }
+    const cat = await loadCatalog(env, false);
+    const taken = new Set(cat.plugins.map((p) => p.id));
+    const list = await getCustomPlugins(env);
+    const added = [];
+    for (const it of items) {
+      if (taken.has(it.id)) return err(`${it.id} 已经在插件目录里了，不需要自定义添加`);
+      const dupIdx = list.findIndex((p) => p.id === it.id);
+      const entry = {
+        id: it.id,
+        name: items.length === 1 && body.name ? String(body.name).trim().slice(0, 40) || it.id : it.id,
+        desc: desc || `自定义插件，来自 ${repo_url.replace('https://', '')}`,
+        desc_en: '', cat: '自定义', kind: 'app', origin: it.origin,
+        deps: [], requires, size_mb: null, rec: false, tut: '', tags: [], hidden: false, custom: true, created_at: now(),
+      };
+      if (dupIdx >= 0) list[dupIdx] = entry; else list.push(entry);
+      added.push(entry);
+    }
+    if (list.length > CUSTOM_PLUGIN_MAX) return err(`自定义插件最多 ${CUSTOM_PLUGIN_MAX} 个，请先删除不用的`);
+    await setConfig(env, 'custom_plugins', JSON.stringify(list));
+    return json({ plugins: added }, 201);
+  }
+
+  async function handleDeleteCustomPlugin(env, id) {
+    const list = await getCustomPlugins(env);
+    if (!list.find((p) => p.id === id)) return err('自定义插件不存在', 404);
+    await setConfig(env, 'custom_plugins', JSON.stringify(list.filter((p) => p.id !== id)));
+    return json({ ok: true });
+  }
+
+  async function handleCatalog(env, url) {
+    const cat = await loadCatalog(env, url.searchParams.get('refresh') === '1');
+    const custom = await getCustomPlugins(env);
+    if (!custom.length) return json(cat);
+    const have = new Set(cat.plugins.map((p) => p.id));
+    const extra = custom.filter((p) => !have.has(p.id));
+    return json({
+      ...cat,
+      categories: cat.categories.concat([{ id: '自定义', order: 99, keywords: '自定义 第三方 自己的' }]),
+      plugins: cat.plugins.concat(extra),
+    });
+  }
+
+  // 校验目录：内容最终会进入编译配置，来自网络的数据必须过滤
+  function sanitizeCatalog(raw) {
+    if (!raw || raw.schema !== 1 || !Array.isArray(raw.plugins) || !Array.isArray(raw.categories)) return null;
+    const httpsUrl = (u) => typeof u === 'string' && /^https:\/\/\S+$/.test(u);
+    const cats = new Set(raw.categories.map((c) => c.id));
+    const sources = (raw.sources || []).filter((s) => s && PROJECT_ID_RE.test(s.id || '') && httpsUrl(s.repo_url) && typeof s.branch === 'string' && s.branch);
+    const plugins = raw.plugins.filter((p) => {
+      if (!p || typeof p.id !== 'string' || !PKG_RE.test(p.id) || !cats.has(p.cat)) return false;
+      if (['app', 'theme', 'proto'].indexOf(p.kind) < 0) return false;
+      if (!Array.isArray(p.deps)) p.deps = [];
+      if (!Array.isArray(p.requires) || p.requires.some((r) => !PKG_RE.test(r))) { if (Array.isArray(p.requires)) return false; p.requires = []; }
+      const o = p.origin || { type: 'builtin' };
+      if (o.type === 'builtin') return true;
+      if (o.type === 'git') return httpsUrl(o.url) && typeof o.name === 'string' && PKG_RE.test(o.name);
+      if (o.type === 'feed') return typeof o.name === 'string' && PKG_RE.test(o.name) && /^src-(git|git-full|link) [A-Za-z0-9_.-]+ https:\/\/\S+$/.test(o.line || '');
+      return false;
+    });
+    if (!plugins.length || !sources.length) return null;
+    return { ...raw, sources, plugins };
+  }
+  let _catCache = { at: 0, data: null };
+  async function loadCatalog(env, force) {
+    if (!force && _catCache.data && Date.now() - _catCache.at < 300000) return _catCache.data;
+    let out = null;
+    try {
+      const repo = await getConfig(env, 'github_repo');
+      if (repo) {
+        const r = await fetch(`https://raw.githubusercontent.com/${repo}/HEAD/catalog.json`, { cf: { cacheTtl: force ? 0 : 300, cacheEverything: !force } });
+        if (r.ok) { const c = sanitizeCatalog(await r.json()); if (c) out = { ...c, source: 'remote' }; }
+      }
+    } catch (e) { /* 读取失败时使用内置目录 */ }
+    if (!out) out = { ...sanitizeCatalog(JSON.parse(JSON.stringify(STORE_FALLBACK))), source: 'embedded' };
+    _catCache = { at: Date.now(), data: out };
+    return out;
+  }
+
+  // 构建结束后，拉起排队中的下一个任务
+  async function dispatchNextQueued(env) {
+    if (await hasActiveBuild(env)) return;
+    const next = await env.DB.prepare("SELECT id FROM builds WHERE status='queued' ORDER BY created_at LIMIT 1").first();
+    if (!next) return;
+    await env.DB.prepare("UPDATE builds SET status='pending', updated_at=? WHERE id=?").bind(now(), next.id).run();
+    try { await dispatchGithubWorkflow(env, next.id); }
+    catch (e) { await env.DB.prepare("UPDATE builds SET status='failed', fail_reason=?, updated_at=? WHERE id=?").bind('触发失败: ' + e.message, now(), next.id).run(); }
+  }
+
   const APP_CSS = `:root {
     --bg: #f8fafc;
     --panel: #ffffff;
@@ -1378,7 +1887,51 @@ function json(data, status = 200, extraHeaders = {}) {
     .field-row { flex-direction: column; }
     .topbar { padding: 0 14px; }
     .topbar .brand span.label { display: none; }
-  }`;
+  }
+  .st-bar { display: grid; grid-template-columns: 1.2fr 1fr 1fr 1.6fr; gap: 12px; margin: 14px 0 18px; }
+  .st-bar label { display: block; font-size: 13px; color: var(--text-dim); }
+  .st-bar select, .st-bar input { width: 100%; margin-top: 4px; }
+  .st-layout { display: grid; grid-template-columns: 1fr 320px; gap: 20px; align-items: start; padding-bottom: 70px; }
+  .chip-row { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip { display: inline-flex; align-items: center; gap: 4px; padding: 3px 4px 3px 10px; background: var(--panel-raised); border: 1px solid var(--border); border-radius: 999px; font-size: 12.5px; }
+  .chip small { color: var(--text-dim); }
+  .chip button { border: 0; background: none; color: var(--text-dim); padding: 0 6px; cursor: pointer; }
+  .st-tools { display: flex; gap: 8px; align-items: flex-start; margin-bottom: 10px; }
+  .st-tools input { flex: 1; min-width: 0; }
+  .st-tools button { white-space: nowrap; }
+  .st-chips, .st-presets { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; align-items: center; font-size: 13px; color: var(--text-dim); }
+  .st-chips button[aria-pressed=true] { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .st-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; }
+  .st-card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius-lg, 12px); padding: 14px; display: flex; flex-direction: column; gap: 8px; cursor: pointer; }
+  .st-card:hover { border-color: var(--accent); }
+  .st-top { display: flex; gap: 10px; align-items: center; }
+  .st-tile { flex: none; width: 42px; height: 42px; border-radius: 11px; display: grid; place-items: center; color: #fff; font-weight: 700; font-size: 17px; }
+  .st-card h3 { margin: 0; font-size: 14px; }
+  .st-card code { font-size: 11.5px; color: var(--text-dim); }
+  .st-card p { margin: 0; font-size: 13px; color: var(--text-dim); min-height: 2.8em; }
+  .st-foot { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-dim); margin-top: auto; }
+  .st-foot button { margin-left: auto; }
+  .st-foot button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .st-basket { position: sticky; top: 14px; background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 14px; display: flex; flex-direction: column; gap: 10px; }
+  .st-basket h2 { margin: 0; font-size: 15px; }
+  .st-basket ul { list-style: none; margin: 0; padding: 0; max-height: 200px; overflow: auto; }
+  .st-basket li { display: flex; align-items: center; padding: 4px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+  .st-basket li button { margin-left: auto; border: 0; background: none; color: var(--text-dim); }
+  .st-sum { display: flex; gap: 18px; font-size: 13px; color: var(--text-dim); }
+  .st-sum b { color: var(--text); font-size: 16px; margin-right: 3px; }
+  .st-warn { background: var(--panel-raised); border-left: 3px solid #d98a00; padding: 7px 10px; font-size: 12.5px; border-radius: 6px; }
+  .st-opt { display: flex; gap: 8px; font-size: 13px; align-items: flex-start; }
+  .st-opt small { display: block; color: var(--text-dim); }
+  .st-basket textarea { width: 100%; height: 100px; font: 11.5px/1.5 var(--font-mono, monospace); }
+  .st-field { position: relative; }
+  .st-dd { position: absolute; left: 0; right: 0; top: 100%; z-index: 20; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; max-height: 280px; overflow: auto; box-shadow: 0 8px 24px rgba(0,0,0,.18); }
+  .st-opt-item { padding: 6px 10px; cursor: pointer; display: flex; flex-direction: column; }
+  .st-opt-item:hover { background: var(--panel-raised); }
+  .st-opt-item small { color: var(--text-dim); }
+  .build-row .links { flex-wrap: wrap; }
+  .fail-log { white-space: pre-wrap; font-size: 12px; background: var(--panel-raised); padding: 8px; border-radius: 6px; margin: 6px 0 0; max-height: 160px; overflow: auto; }
+  @media (max-width: 900px) { .st-bar, .st-layout { grid-template-columns: 1fr; } .st-basket { position: static; } }
+`;
   
   const APP_JS = `
   const api = {
@@ -1432,9 +1985,11 @@ function json(data, status = 200, extraHeaders = {}) {
     const h = location.hash.replace(/^#\\/?/, '');
     const parts = h.split('/').filter(Boolean);
     if (parts[0] === 'template' && parts[1]) return { name: 'template-detail', params: { id: parts[1] } };
-    if (parts[0] === 'trigger' && parts[1]) return { name: 'trigger', params: { id: parts[1] } };
+    if (parts[0] === 'trigger' && parts[1]) return { name: 'template-detail', params: { id: parts[1] } };
+    if (parts[0] === 'store' && parts[1]) return { name: 'store', params: { tpl: parts[1] } };
     if (parts[0] === 'builds') return { name: 'builds', params: {} };
-    return { name: 'templates', params: {} };
+    if (parts[0] === 'templates') return { name: 'templates', params: {} };
+    return { name: 'store', params: {} };
   }
   
   function navigate(hash) { location.hash = hash; }
@@ -1464,8 +2019,8 @@ function json(data, status = 200, extraHeaders = {}) {
   function qsa(root, sel) { return Array.from(root.querySelectorAll(sel)); }
   
   const SOURCE_LABELS = { manual_upload: '手动上传', menuconfig_push: 'menuconfig推送', imported: '导入' };
-  const STATUS_LABELS = { pending: '排队中', running: '准备中', menuconfig: '配置中', compiling: '编译中', success: '成功', failed: '失败', cancelled: '已取消' };
-  const ACTIVE_BUILD_STATUSES = ['pending', 'running', 'menuconfig', 'compiling'];
+  const STATUS_LABELS = { queued: '排队等待', pending: '排队中', running: '准备中', menuconfig: '配置中', compiling: '编译中', success: '成功', failed: '失败', cancelled: '已取消' };
+  const ACTIVE_BUILD_STATUSES = ['queued', 'pending', 'running', 'menuconfig', 'compiling'];
   
   // 取消编译：列表页和触发页的实时进度卡片共用这一个处理函数
   async function cancelBuildWithConfirm(buildId, onDone) {
@@ -1711,6 +2266,7 @@ function json(data, status = 200, extraHeaders = {}) {
     <div class="topbar">
       <div class="brand"><span class="dot"></span><span class="label">OpenWrt 自动编译</span></div>
       <nav>
+        <button data-nav="#/store" class="\${activeName === 'store' ? 'active' : ''}">插件商店</button>
         <button data-nav="#/templates" class="\${activeName === 'templates' || activeName === 'template-detail' || activeName === 'trigger' ? 'active' : ''}">模板</button>
         <button data-nav="#/builds" class="\${activeName === 'builds' ? 'active' : ''}">编译记录</button>
       </nav>
@@ -1810,7 +2366,7 @@ function json(data, status = 200, extraHeaders = {}) {
       <div class="page-head">
         <div>
           <h1>编译模板</h1>
-          <div class="sub">每个模板对应一套源码、插件与 .config 配置</div>
+          <div class="sub">每个模板是一套保存好的机型和插件清单，找到它点「编译」即可</div>
         </div>
         <div class="actions">
           <button class="primary" id="new-tpl-btn">+ 新建模板</button>
@@ -1819,7 +2375,7 @@ function json(data, status = 200, extraHeaders = {}) {
       <div id="tpl-list-area"><div style="text-align:center;padding:40px;"><span class="spinner"></span></div></div>
     </div>\`;
     bindTopbar(app);
-    qs(app, '#new-tpl-btn').addEventListener('click', () => openTemplateEditModal(null));
+    qs(app, '#new-tpl-btn').addEventListener('click', () => navigate('#/store'));
     try {
       const { templates } = await api.listTemplates();
       store.templates = templates;
@@ -1837,29 +2393,40 @@ function json(data, status = 200, extraHeaders = {}) {
       <div class="empty-state">
         <div class="glyph">∅</div>
         <div class="msg">还没有任何编译模板</div>
-        <div class="sub">点击右上角"新建模板"开始，或导入已有的模板文件</div>
+        <div class="sub">点击右上角"新建模板"，在插件商店里选好机型和插件，或导入已有的模板文件</div>
       </div>\`;
       return;
     }
     area.innerHTML = \`<div class="template-grid">\${templates.map(templateRowHtml).join('')}</div>\`;
     qsa(area, '.template-row').forEach((row) => {
       row.addEventListener('click', (ev) => {
+        const bb = ev.target.closest('[data-build]');
+        if (bb) { buildFromList(bb.dataset.build, bb); return; }
         if (ev.target.closest('[data-stop]')) return;
         navigate(\`#/template/\${row.dataset.id}\`);
       });
     });
   }
   
+  async function buildFromList(id, btn) {
+    const t = (store.templates || []).find((x) => x.id === id);
+    if (!confirm('编译「' + (t ? t.name : '') + '」？')) return;
+    btn.disabled = true;
+    try { await api.trigger({ template_id: id }); toast('已提交编译任务', 'success'); navigate('#/builds'); }
+    catch (e) { reportApiError(e, '提交失败'); btn.disabled = false; }
+  }
+
   function templateRowHtml(t) {
-    const pluginCount = (t.plugins || []).length;
+    const n = (t.selection && t.selection.length) ? t.selection.length : (t.plugins || []).length;
     const schedTag = t.schedule_enabled ? \`<span class="badge warn">定时 \${escapeHtml(t.schedule_cron || '')}</span>\` : \`<span class="badge dim">未定时</span>\`;
+    const pinTag = t.pin_dotconfig_version_id ? \`<span class="badge dim">固定配置</span>\` : '';
     return \`
     <div class="template-row" data-id="\${t.id}">
       <div class="main">
         <div class="name">\${escapeHtml(t.name)}</div>
-        <div class="meta">\${escapeHtml(t.target)} · \${escapeHtml(t.branch)} · \${pluginCount} 个插件</div>
+        <div class="meta">\${escapeHtml(t.target)}\${t.profile ? ' · ' + escapeHtml(t.profile) : ''} · \${escapeHtml(t.branch)} · \${n} 个插件</div>
       </div>
-      <div class="tags">\${schedTag}</div>
+      <div class="tags">\${pinTag}\${schedTag}<button class="small primary" data-stop data-build="\${t.id}">编译</button></div>
       <div class="chevron">›</div>
     </div>\`;
   }
@@ -1881,141 +2448,46 @@ function json(data, status = 200, extraHeaders = {}) {
     overlay.remove();
   }
   
-  function pluginItemHtml(p = {}, idx) {
-    const sparse = !!p.sparse;
-    return \`
-    <div class="plugin-item" data-idx="\${idx}">
-      <div class="row1">
-        <input type="text" class="p-name" placeholder="插件名" value="\${escapeHtml(p.name || '')}" />
-        <button type="button" class="ghost small remove-btn" data-remove>删除</button>
-      </div>
-      <input type="text" class="p-url" placeholder="git_url，例如 https://github.com/xxx/yyy" value="\${escapeHtml(p.git_url || '')}" style="margin-bottom:8px;" />
-      <div class="sparse-row">
-        <label class="inline"><input type="checkbox" class="p-sparse" \${sparse ? 'checked' : ''}/> 稀疏克隆</label>
-      </div>
-      <div class="sub-fields" style="display:\${sparse ? 'flex' : 'none'};">
-        <input type="text" class="p-branch" placeholder="branch" value="\${escapeHtml(p.branch || '')}" />
-        <input type="text" class="p-dirs" placeholder="子目录，逗号分隔" value="\${escapeHtml((p.dirs || []).join(','))}" />
-      </div>
-    </div>\`;
-  }
-  
-  function bindPluginList(container) {
-    function rebind() {
-      qsa(container, '.plugin-item').forEach((item) => {
-        const sparseBox = qs(item, '.p-sparse');
-        const subFields = qs(item, '.sub-fields');
-        sparseBox.onchange = () => { subFields.style.display = sparseBox.checked ? 'flex' : 'none'; };
-        qs(item, '[data-remove]').onclick = () => { item.remove(); };
-      });
-    }
-    rebind();
-    return rebind;
-  }
-  
-  function readPluginsFromContainer(container) {
-    return qsa(container, '.plugin-item').map((item) => {
-      const name = qs(item, '.p-name').value.trim();
-      const git_url = qs(item, '.p-url').value.trim();
-      const sparse = qs(item, '.p-sparse').checked;
-      const plugin = { name, git_url, sparse };
-      if (sparse) {
-        plugin.branch = qs(item, '.p-branch').value.trim();
-        plugin.dirs = qs(item, '.p-dirs').value.split(',').map((s) => s.trim()).filter(Boolean);
-      }
-      return plugin;
-    }).filter((p) => p.name && p.git_url);
-  }
-  
   function openTemplateEditModal(tpl) {
-    const isEdit = !!tpl;
     const overlay = openModal(\`
     <div class="modal-box">
       <div class="modal-head">
-        <h3>\${isEdit ? '编辑模板' : '新建模板'}</h3>
+        <h3>名称与自定义脚本</h3>
         <button class="ghost small" data-close>✕</button>
       </div>
       <div class="modal-body">
         <div class="field">
           <label>模板名称</label>
-          <input type="text" id="f-name" value="\${escapeHtml(tpl?.name || '')}" placeholder="例如：小米 AX3600 · 翻墙版" />
-        </div>
-        <div class="field">
-          <label>源码仓库 repo_url</label>
-          <input type="text" id="f-repo" value="\${escapeHtml(tpl?.repo_url || '')}" placeholder="https://github.com/coolsnowwolf/lede" />
-        </div>
-        <div class="field-row">
-          <div class="field">
-            <label>分支 branch</label>
-            <input type="text" id="f-branch" value="\${escapeHtml(tpl?.branch || 'master')}" />
-          </div>
-          <div class="field">
-            <label>目标平台 target</label>
-            <input type="text" id="f-target" value="\${escapeHtml(tpl?.target || '')}" placeholder="mediatek/mt7986a" />
-          </div>
-        </div>
-        <div class="field">
-          <label>插件列表</label>
-          <div class="plugin-list" id="plugin-list"></div>
-          <button type="button" class="small" id="add-plugin-btn">+ 添加插件</button>
+          <input type="text" id="f-name" maxlength="80" value="\${escapeHtml(tpl.name || '')}" />
         </div>
         <div class="field">
           <label>自定义脚本 (feeds update 之前执行)</label>
-          <textarea id="f-script1" rows="5" placeholder="#!/bin/bash">\${escapeHtml(tpl?.diy_script_1 || '')}</textarea>
+          <textarea id="f-script1" rows="5" placeholder="#!/bin/bash">\${escapeHtml(tpl.diy_script_1 || '')}</textarea>
         </div>
         <div class="field">
           <label>自定义脚本② (feeds install 之后执行)</label>
-          <textarea id="f-script2" rows="5" placeholder="#!/bin/bash">\${escapeHtml(tpl?.diy_script_2 || '')}</textarea>
+          <textarea id="f-script2" rows="5" placeholder="#!/bin/bash">\${escapeHtml(tpl.diy_script_2 || '')}</textarea>
         </div>
+        <div class="hint">机型和插件请点「编辑机型和插件」回到商店修改。</div>
       </div>
       <div class="modal-foot">
         <button data-close>取消</button>
-        <button class="primary" id="save-tpl-btn">\${isEdit ? '保存更改' : '创建模板'}</button>
+        <button class="primary" id="save-tpl-btn">保存更改</button>
       </div>
     </div>\`, {
       onMount(root) {
-        const list = qs(root, '#plugin-list');
-        const plugins = tpl?.plugins || [];
-        list.innerHTML = plugins.map((p, i) => pluginItemHtml(p, i)).join('');
-        let rebind = bindPluginList(list);
-        qs(root, '#add-plugin-btn').addEventListener('click', () => {
-          list.insertAdjacentHTML('beforeend', pluginItemHtml({}, list.children.length));
-          rebind = bindPluginList(list);
-        });
         qsa(root, '[data-close]').forEach((b) => b.addEventListener('click', () => closeModal(root)));
         qs(root, '#save-tpl-btn').addEventListener('click', async () => {
-          const body = {
-            name: qs(root, '#f-name').value.trim(),
-            repo_url: qs(root, '#f-repo').value.trim(),
-            branch: qs(root, '#f-branch').value.trim(),
-            target: qs(root, '#f-target').value.trim(),
-            plugins: readPluginsFromContainer(list),
-            diy_script_1: qs(root, '#f-script1').value,
-            diy_script_2: qs(root, '#f-script2').value,
-          };
-          if (!body.name || !body.repo_url || !body.branch || !body.target) {
-            toast('请填写名称 / 仓库 / 分支 / 目标平台', 'error'); return;
-          }
+          const body = { name: qs(root, '#f-name').value.trim(), diy_script_1: qs(root, '#f-script1').value, diy_script_2: qs(root, '#f-script2').value };
+          if (!body.name) { toast('请填写模板名称', 'error'); return; }
           const btn = qs(root, '#save-tpl-btn');
           btn.disabled = true;
           try {
-            if (isEdit) {
-              await api.updateTemplate(tpl.id, body);
-              toast('模板已更新', 'success');
-            } else {
-              const res = await api.createTemplate(body);
-              toast('模板已创建', 'success');
-              closeModal(root);
-              navigate(\`#/template/\${res.template.id}\`);
-              return;
-            }
+            await api.updateTemplate(tpl.id, body);
+            toast('模板已更新', 'success');
             closeModal(root);
-            if (store.route.name === 'template-detail') renderTemplateDetailPage(store.route.params.id);
-            else renderTemplatesPage();
-          } catch (e) {
-            reportApiError(e, '保存失败');
-            btn.disabled = false;
-          }
+            refreshTemplateDetail(tpl.id);
+          } catch (e) { reportApiError(e, '保存失败'); btn.disabled = false; }
         });
       }
     });
@@ -2106,60 +2578,90 @@ function json(data, status = 200, extraHeaders = {}) {
     renderTemplateDetailBody(tpl, history);
   }
   
+  function tplConfigLines(tpl) {
+    const NL = String.fromCharCode(10), lines = [], tp = String(tpl.target || '').split('/');
+    if (tpl.profile && tp.length === 2) lines.push('CONFIG_TARGET_' + tp[0] + '=y', 'CONFIG_TARGET_' + tp[0] + '_' + tp[1] + '=y', 'CONFIG_TARGET_' + tp[0] + '_' + tp[1] + '_DEVICE_' + tpl.profile + '=y');
+    (tpl.packages || []).forEach((p) => { lines.push('CONFIG_PACKAGE_' + p + '=y'); });
+    return lines.join(NL);
+  }
+  async function tplEnsureCatalog() { if (!STORE.loaded) storeApplyCatalog(await api.get('/api/catalog')); }
+  // 由插件选择重新算出包清单和第三方来源（移除插件后用）
+  function tplCompose(ids, tpl) {
+    const S = ids.map((id) => storeBy(id) || storeSynth(id, tpl.plugins)), pk = new Set();
+    S.forEach((p) => { pk.add(p.id); (p.requires || []).forEach((r) => { pk.add(r); }); });
+    return { selection: ids, packages: Array.from(pk), plugins: storeMergePlugins(S) };
+  }
+
   function renderTemplateDetailBody(tpl, history) {
     const area = document.getElementById('detail-area');
-    area.innerHTML = \`
-    <div class="page-head">
-      <div>
-        <h1>\${escapeHtml(tpl.name)}</h1>
-        <div class="sub mono">\${escapeHtml(tpl.repo_url)} @ \${escapeHtml(tpl.branch)} · \${escapeHtml(tpl.target)}</div>
-      </div>
-      <div class="actions">
-        <button id="edit-tpl-btn">编辑模板</button>
-        <button class="primary" id="goto-trigger-btn">触发编译</button>
-      </div>
-    </div>
-    <div class="section">
-      <h2>
-        <span>.config 版本历史</span>
-        <span class="actions">
-          <button class="small" id="export-tpl-btn">导出模板</button>
-          <button class="small" id="upload-cfg-btn">上传新版本</button>
-        </span>
-      </h2>
-      <div id="version-history-area"></div>
-    </div>
-    <div class="section">
-      <h2><span>定时编译</span></h2>
-      <div id="schedule-area"></div>
-    </div>
-    <div class="section">
-      <h2><span>插件 (\${(tpl.plugins || []).length})</span></h2>
-      <div id="plugin-readonly-area"></div>
-    </div>
-    <div class="section">
-      <h2><span>危险操作</span></h2>
-      <button class="danger" id="delete-tpl-btn">删除该模板</button>
-    </div>\`;
-  
+    area.innerHTML = '<div class="page-head"><div><h1>' + escapeHtml(tpl.name) + '</h1><div class="sub mono">' + escapeHtml(tpl.repo_url) + ' @ ' + escapeHtml(tpl.branch) + ' · ' + escapeHtml(tpl.target) + (tpl.profile ? ' · ' + escapeHtml(tpl.profile) : '') + '</div></div>'
+      + '<div class="actions"><button id="edit-tpl-btn">名称与脚本</button><button id="edit-store-btn">编辑机型和插件</button><button class="primary" id="build-btn">编译</button></div></div>'
+      + '<div class="section"><h2><span>固件清单</span></h2><div id="manifest-area"></div></div>'
+      + '<div class="section"><h2><span>编译选项</span></h2><div id="options-area"></div></div>'
+      + '<div class="section"><h2><span>定时编译</span></h2><div id="schedule-area"></div></div>'
+      + '<div class="section"><h2><span>.config 版本历史</span><span class="actions"><button class="small" id="export-tpl-btn">导出模板</button><button class="small" id="upload-cfg-btn">上传新版本</button></span></h2><div id="version-history-area"></div></div>'
+      + '<div class="section"><h2><span>危险操作</span></h2><button class="danger" id="delete-tpl-btn">删除该模板</button></div>';
+
     qs(area, '#edit-tpl-btn').addEventListener('click', () => openTemplateEditModal(tpl));
-    qs(area, '#goto-trigger-btn').addEventListener('click', () => navigate(\`#/trigger/\${tpl.id}\`));
+    qs(area, '#edit-store-btn').addEventListener('click', () => navigate('#/store/' + tpl.id));
     qs(area, '#export-tpl-btn').addEventListener('click', () => exportTemplate(tpl));
     qs(area, '#upload-cfg-btn').addEventListener('click', () => openUploadConfigModal(tpl));
     qs(area, '#delete-tpl-btn').addEventListener('click', () => confirmDeleteTemplate(tpl));
+    qs(area, '#build-btn').addEventListener('click', async (ev) => {
+      const btn = ev.currentTarget;
+      btn.disabled = true; btn.textContent = '提交中…';
+      try { await api.trigger({ template_id: tpl.id }); toast('已提交编译任务', 'success'); navigate('#/builds'); }
+      catch (e) { reportApiError(e, '提交失败'); btn.disabled = false; btn.textContent = '编译'; }
+    });
+    renderManifest(tpl);
+    renderOptions(tpl, history);
     renderVersionHistory(tpl, history);
     renderScheduleSection(tpl, history);
-    renderPluginReadonly(tpl);
   }
-  
-  function renderPluginReadonly(tpl) {
-    const wrap = document.getElementById('plugin-readonly-area');
-    const plugins = tpl.plugins || [];
-    if (!plugins.length) { wrap.innerHTML = \`<div class="hint">未配置插件</div>\`; return; }
-    wrap.innerHTML = plugins.map((p) => \`
-      <div class="hint mono" style="margin-bottom:4px;">
-        \${escapeHtml(p.name)} — \${escapeHtml(p.git_url)}\${p.sparse ? \` (稀疏: \${escapeHtml((p.dirs || []).join(', '))} @ \${escapeHtml(p.branch || '')})\` : ''}
-      </div>\`).join('');
+
+  async function renderManifest(tpl) {
+    const wrap = document.getElementById('manifest-area');
+    try { await tplEnsureCatalog(); } catch (e) { /* 目录读取失败时仍显示包名 */ }
+    const ids = (tpl.selection && tpl.selection.length) ? tpl.selection : null;
+    let h = '<div class="hint">机型：<b>' + (tpl.profile ? escapeHtml(tpl.profile) : '未选择') + '</b> · 平台 ' + escapeHtml(tpl.target) + '</div>';
+    if (ids) {
+      h += '<div class="hint" style="margin:8px 0 4px">已选插件 ' + ids.length + ' 个（共 ' + (tpl.packages || []).length + ' 个包，含自动依赖）。移除插件在这里直接点 ×，要添加请点右上角「编辑机型和插件」。</div><div class="chip-row">'
+        + ids.map((id) => { const p = storeBy(id); return '<span class="chip">' + escapeHtml(p ? p.name : id) + (p && p.custom ? ' <small>自定义</small>' : '') + (!p ? ' <small>目录已无</small>' : '') + '<button data-rm-plugin="' + escapeHtml(id) + '" aria-label="移除">×</button></span>'; }).join('') + '</div>';
+    } else if ((tpl.packages || []).length) {
+      h += '<div class="hint" style="margin:8px 0 4px">这个模板是旧版本创建的，没有记录插件选择。点右上角「编辑机型和插件」重新选一次并保存，就能在这里管理。当前包清单（' + tpl.packages.length + ' 个）：</div><div class="hint mono" style="word-break:break-all">' + escapeHtml(tpl.packages.join(', ')) + '</div>';
+    } else {
+      h += '<div class="hint" style="margin:8px 0 4px">还没有插件清单。点右上角「编辑机型和插件」去选择。</div>';
+    }
+    if ((tpl.plugins || []).length) {
+      h += '<div class="hint" style="margin:10px 0 4px">第三方插件来源（' + tpl.plugins.length + '）：</div>' + tpl.plugins.map((p) => '<div class="hint mono" style="margin-bottom:3px">' + escapeHtml(p.name) + ' — ' + escapeHtml(p.feed || p.git_url || '') + (p.sparse ? ' (子目录: ' + escapeHtml((p.dirs || []).join(', ')) + (p.branch ? ' @ ' + escapeHtml(p.branch) : '') + ')' : (p.branch ? ' @ ' + escapeHtml(p.branch) : '')) + '</div>').join('');
+    }
+    h += '<details style="margin-top:10px"><summary class="hint">查看将写入的配置行</summary><textarea readonly style="width:100%;height:140px;font:11.5px/1.5 monospace;margin-top:6px">' + escapeHtml(tplConfigLines(tpl)) + '</textarea><div class="hint">编译时，源码会先生成这个机型的默认配置，再合并这些行，并检查是否都生效；有没生效的会直接失败，并告诉你是哪几个。</div></details>';
+    wrap.innerHTML = h;
+    qsa(wrap, '[data-rm-plugin]').forEach((b) => b.addEventListener('click', async () => {
+      const next = ids.filter((x) => x !== b.dataset.rmPlugin);
+      try { await api.updateTemplate(tpl.id, tplCompose(next, tpl)); toast('已移除', 'success'); refreshTemplateDetail(tpl.id); }
+      catch (e) { reportApiError(e, '移除失败'); }
+    }));
+  }
+
+  function renderOptions(tpl, history) {
+    const wrap = document.getElementById('options-area');
+    const pin = tpl.pin_dotconfig_version_id || '';
+    const opts = '<option value="">不固定（推荐）：每次按上面的清单重新生成</option>' + history.map((v) => {
+      const label = (SOURCE_LABELS[v.source] || v.source) + ' ' + fmtTime(v.created_at) + (v.label ? ' "' + v.label + '"' : '');
+      return '<option value="' + v.id + '"' + (v.id === pin ? ' selected' : '') + '>固定为：' + escapeHtml(label) + '</option>';
+    }).join('');
+    wrap.innerHTML = '<label class="st-opt"><input type="checkbox" id="opt-mc"' + (tpl.menuconfig ? ' checked' : '') + '><span>编译前进入 menuconfig 微调<small>默认不需要，仅在要改内核或驱动时开启。定时编译不会进入 menuconfig。</small></span></label>'
+      + '<div class="field" style="margin:14px 0 0"><label>配置底稿</label><select id="opt-pin">' + opts + '</select>'
+      + '<div class="hint">固定后，编译直接使用该版本，不再叠加上面的机型和插件清单。menuconfig 里保存的配置不会自动固定，要沿用它请在这里选择对应版本。手动编译和定时编译共用这个设置。</div></div>';
+    qs(wrap, '#opt-mc').addEventListener('change', async (e) => {
+      try { await api.updateTemplate(tpl.id, { menuconfig: e.target.checked }); toast(e.target.checked ? '编译时将进入 menuconfig' : '编译时不进入 menuconfig', 'success'); }
+      catch (err) { reportApiError(err, '保存失败'); e.target.checked = !e.target.checked; }
+    });
+    qs(wrap, '#opt-pin').addEventListener('change', async (e) => {
+      try { await api.updateTemplate(tpl.id, { pin_dotconfig_version_id: e.target.value }); toast(e.target.value ? '已固定配置底稿' : '已取消固定', 'success'); refreshTemplateDetail(tpl.id); }
+      catch (err) { reportApiError(err, '保存失败'); }
+    });
   }
   
   async function exportTemplate(tpl) {
@@ -2217,8 +2719,8 @@ function json(data, status = 200, extraHeaders = {}) {
     }
     const rows = history.map((v, idx) => {
       const isCurrent = tpl.dotconfig_version_id === v.id;
-      const isSched = tpl.schedule_dotconfig_version_id === v.id;
-      const refTags = \`\${isCurrent ? '<span class="ref-tag">当前</span>' : ''}\${isSched ? '<span class="ref-tag sched">定时</span>' : ''}\`;
+      const isSched = tpl.pin_dotconfig_version_id === v.id;
+      const refTags = \`\${isCurrent ? '<span class="ref-tag">当前</span>' : ''}\${isSched ? '<span class="ref-tag sched">固定</span>' : ''}\`;
       const canDelete = !isCurrent && !isSched;
       return \`
       <tr data-vid="\${v.id}">
@@ -2237,8 +2739,8 @@ function json(data, status = 200, extraHeaders = {}) {
             <button class="ghost small" data-view>查看</button>
             <button class="ghost small" data-download>下载</button>
             \${isCurrent ? '' : '<button class="small" data-set-current>设为当前</button>'}
-            \${isSched ? '' : '<button class="small" data-set-sched>设为定时用</button>'}
-            <button class="ghost small danger" data-delete \${canDelete ? '' : 'disabled title="请先切换引用再删除"'}>删除</button>
+            \${isSched ? '<button class="small" data-unpin>取消固定</button>' : '<button class="small" data-set-sched>固定为底稿</button>'}
+            <button class="ghost small danger" data-delete \${canDelete ? '' : 'disabled title="请先切换或取消引用再删除"'}>删除</button>
           </div>
         </td>
       </tr>\`;
@@ -2264,7 +2766,11 @@ function json(data, status = 200, extraHeaders = {}) {
       });
       const setSchedBtn = qs(row, '[data-set-sched]');
       if (setSchedBtn) setSchedBtn.addEventListener('click', async () => {
-        try { await api.setSchedule(tpl.id, { dotconfig_version_id: vid, enabled: tpl.schedule_enabled, cron: tpl.schedule_cron }); toast('已设为定时任务使用版本', 'success'); refreshTemplateDetail(tpl.id); } catch (e) { reportApiError(e, '设置失败'); }
+        try { await api.updateTemplate(tpl.id, { pin_dotconfig_version_id: vid }); toast('已固定为配置底稿', 'success'); refreshTemplateDetail(tpl.id); } catch (e) { reportApiError(e, '设置失败'); }
+      });
+      const unpinBtn = qs(row, '[data-unpin]');
+      if (unpinBtn) unpinBtn.addEventListener('click', async () => {
+        try { await api.updateTemplate(tpl.id, { pin_dotconfig_version_id: '' }); toast('已取消固定', 'success'); refreshTemplateDetail(tpl.id); } catch (e) { reportApiError(e, '设置失败'); }
       });
       const delBtn = qs(row, '[data-delete]');
       if (delBtn && !delBtn.disabled) delBtn.addEventListener('click', () => confirmDeleteVersion(tpl.id, vid));
@@ -2401,14 +2907,7 @@ function json(data, status = 200, extraHeaders = {}) {
   function renderScheduleSection(tpl, history) {
     const wrap = document.getElementById('schedule-area');
     const enabled = !!tpl.schedule_enabled;
-    const versionOptions = history.map((v) => {
-      const tagBits = [];
-      if (tpl.dotconfig_version_id === v.id) tagBits.push('当前');
-      if (tpl.schedule_dotconfig_version_id === v.id) tagBits.push('定时');
-      const label = \`\${SOURCE_LABELS[v.source] || v.source} \${fmtTime(v.created_at)}\${v.label ? ' "' + v.label + '"' : ''}\${tagBits.length ? ' (' + tagBits.join('/') + ')' : ''}\`;
-      const selected = v.id === tpl.schedule_dotconfig_version_id ? 'selected' : '';
-      return \`<option value="\${v.id}" \${selected}>\${escapeHtml(label)}</option>\`;
-    }).join('');
+    const pinned = !!tpl.pin_dotconfig_version_id;
     wrap.innerHTML = \`
     <div class="schedule-form">
       <div class="schedule-toggle-row">
@@ -2426,11 +2925,7 @@ function json(data, status = 200, extraHeaders = {}) {
         </div>
         <div class="hint">Cloudflare 免费计划最多 3 个 cron 槽位；实际触发有约 30 秒抖动</div>
       </div>
-      <div class="field" style="margin-bottom:0;">
-        <label>使用版本</label>
-        \${history.length ? \`<select id="sched-version"><option value="">— 未选择 —</option>\${versionOptions}</select>\` : \`<div class="hint">该模板暂无任何 .config 版本，请先上传一份才能启用定时编译</div>\`}
-      </div>
-      <div class="warn-line">⚠️ 定时编译必须选择一个 .config 版本，否则无法保存启用状态</div>
+      <div class="hint">\${pinned ? '当前固定了配置底稿，定时编译直接使用该版本。' : '当前没有固定配置底稿，每次定时编译都会按上面的机型和插件清单重新生成配置。'}可在上面的「编译选项」里修改。</div>
       <div>
         <button class="primary" id="save-sched-btn">保存定时设置</button>
       </div>
@@ -2439,158 +2934,15 @@ function json(data, status = 200, extraHeaders = {}) {
     qs(wrap, '#save-sched-btn').addEventListener('click', async () => {
       const enabledNow = qs(wrap, '#sched-enabled').checked;
       const cron = qs(wrap, '#sched-cron').value.trim();
-      const versionSelect = qs(wrap, '#sched-version');
-      const versionId = versionSelect ? versionSelect.value || undefined : undefined;
-      if (enabledNow && !versionId) { toast('定时编译必须选择一个 .config 版本', 'error'); return; }
       if (enabledNow && !cron) { toast('请填写 cron 表达式', 'error'); return; }
       const btn = qs(wrap, '#save-sched-btn');
       btn.disabled = true;
       try {
-        await api.setSchedule(tpl.id, { enabled: enabledNow, cron: cron || null, dotconfig_version_id: versionId });
+        await api.setSchedule(tpl.id, { enabled: enabledNow, cron: cron || null });
         toast('定时设置已保存', 'success');
         refreshTemplateDetail(tpl.id);
       } catch (e) { reportApiError(e, '保存失败'); btn.disabled = false; }
     });
-  }
-  
-  async function renderTriggerPage(tplId) {
-    const app = document.getElementById('app');
-    app.innerHTML = \`
-    <div id="toast-wrap" class="toast-wrap"></div>
-    \${renderTopbar('trigger')}
-    <div class="content">
-      <div class="detail-back"><button class="ghost small" id="back-btn">‹ 返回模板详情</button></div>
-      <div id="trigger-area"><div style="text-align:center;padding:40px;"><span class="spinner"></span></div></div>
-    </div>\`;
-    bindTopbar(app);
-    qs(app, '#back-btn').addEventListener('click', () => navigate(\`#/template/\${tplId}\`));
-    let tpl, history;
-    try {
-      [{ template: tpl }, { history }] = await Promise.all([api.getTemplate(tplId), api.listHistory(tplId)]);
-    } catch (e) {
-      qs(app, '#trigger-area').innerHTML = \`<div class="empty-state"><div class="msg">加载失败：\${escapeHtml(e.message)}</div></div>\`;
-      return;
-    }
-    renderTriggerForm(tpl, history);
-
-    // 页面刷新后自动恢复轮询：检查该模板是否有进行中的 build
-    try {
-      const { builds } = await api.listBuilds();
-      const active = builds.find((b) =>
-        b.template_id === tplId &&
-        ['pending', 'running', 'menuconfig', 'compiling'].includes(b.status)
-      );
-      if (active) startBuildWatch(active.id);
-    } catch {}
-  }
-  
-  function renderTriggerForm(tpl, history) {
-    const area = document.getElementById('trigger-area');
-    const versionOptions = history.map((v) => {
-      const tagBits = [];
-      if (tpl.dotconfig_version_id === v.id) tagBits.push('当前');
-      if (tpl.schedule_dotconfig_version_id === v.id) tagBits.push('定时');
-      const label = \`\${SOURCE_LABELS[v.source] || v.source} \${fmtTime(v.created_at)}\${v.label ? ' "' + v.label + '"' : ''}\${tagBits.length ? ' (' + tagBits.join('/') + ')' : ''}\`;
-      return \`<option value="\${v.id}">\${escapeHtml(label)}</option>\`;
-    }).join('');
-    const defaultVersion = tpl.dotconfig_version_id || '';
-    area.innerHTML = \`
-    <div class="page-head">
-      <div>
-        <h1>触发编译 — \${escapeHtml(tpl.name)}</h1>
-        <div class="sub">手动触发将进入网页终端做 menuconfig 配置，保存退出后自动编译</div>
-      </div>
-    </div>
-    <div class="section trigger-panel">
-      <h2><span>menuconfig 底稿（可选）</span></h2>
-      <label class="radio-option \${!history.length ? 'selected' : ''}" data-radio-wrap>
-        <input type="radio" name="dotconfig-mode" value="none" \${!history.length ? 'checked' : ''} />
-        <div class="opt-body">
-          <div class="opt-title">无（从零开始，menuconfig 全部默认值）</div>
-        </div>
-      </label>
-      <label class="radio-option \${history.length ? 'selected' : ''}" data-radio-wrap>
-        <input type="radio" name="dotconfig-mode" value="history" \${history.length ? 'checked' : ''} \${!history.length ? 'disabled' : ''} />
-        <div class="opt-body">
-          <div class="opt-title">使用历史版本：</div>
-          \${history.length ? \`<select id="version-select">\${versionOptions}</select>\` : \`<div class="hint">该模板暂无历史版本</div>\`}
-        </div>
-      </label>
-      <div>
-        <button class="primary" id="do-trigger-btn">触发编译</button>
-      </div>
-    </div>
-    <div id="trigger-result-area"></div>\`;
-    if (defaultVersion) {
-      const sel = qs(area, '#version-select');
-      if (sel) sel.value = defaultVersion;
-    }
-    qsa(area, '[data-radio-wrap]').forEach((wrap) => {
-      const radio = qs(wrap, 'input[type=radio]');
-      radio.addEventListener('change', () => {
-        qsa(area, '[data-radio-wrap]').forEach((w) => w.classList.remove('selected'));
-        if (radio.checked) wrap.classList.add('selected');
-      });
-    });
-    qs(area, '#do-trigger-btn').addEventListener('click', async () => {
-      const mode = area.querySelector('input[name=dotconfig-mode]:checked')?.value;
-      const versionId = mode === 'history' ? qs(area, '#version-select')?.value : null;
-      const btn = qs(area, '#do-trigger-btn');
-      btn.disabled = true;
-      btn.innerHTML = '<span class="spinner"></span> 触发中...';
-      try {
-        const res = await api.trigger({ template_id: tpl.id, dotconfig_version_id: versionId || undefined });
-        toast('已触发编译任务', 'success');
-        startBuildWatch(res.build_id);
-      } catch (e) { reportApiError(e, '触发失败'); btn.disabled = false; btn.textContent = '触发编译'; }
-    });
-  }
-  
-  function startBuildWatch(buildId) {
-    const resultArea = document.getElementById('trigger-result-area');
-    if (!resultArea) return;
-    if (store.pollTimer) { clearInterval(store.pollTimer); store.pollTimer = null; }
-    async function tick() {
-      let build;
-      try { const res = await api.getBuild(buildId); build = res.build; } catch (e) { return; }
-      renderBuildWatchCard(resultArea, build);
-      if (['success', 'failed', 'cancelled'].includes(build.status)) { clearInterval(store.pollTimer); store.pollTimer = null; }
-    }
-    tick();
-    store.pollTimer = setInterval(tick, 5000);
-  }
-  
-  function renderBuildWatchCard(container, build) {
-    const showTerminal = build.status === 'menuconfig' && build.web_url;
-    const canCancel = ACTIVE_BUILD_STATUSES.includes(build.status);
-    container.innerHTML = \`
-    <div class="section">
-      <h2><span>编译状态</span><span class="badge \${statusBadgeClass(build.status)}">\${STATUS_LABELS[build.status] || build.status}</span></h2>
-      \${renderTimeline(build)}
-      <div class="timeline-labels">
-        \${(build.trigger_type === 'scheduled' ? ['排队', '准备', '编译', '完成'] : ['排队', '准备', '配置', '编译', '完成']).map((l) => \`<span>\${l}</span>\`).join('')}
-      </div>
-      \${showTerminal ? \`
-      <div style="margin-top:18px;padding:20px;background:var(--panel-raised);border:1px solid var(--border);border-radius:var(--radius-lg);text-align:center;">
-        <div style="font-size:13px;color:var(--text-dim);margin-bottom:14px;">
-          menuconfig 终端已就绪，在 ncurses 界面完成配置后保存退出，自动推送并开始编译
-        </div>
-        <a href="\${escapeHtml(build.web_url)}" target="_blank" rel="noopener">
-          <button class="primary" style="font-size:14px;padding:10px 28px;">🖥️ 打开 menuconfig 终端</button>
-        </a>
-        <div class="hint" style="margin-top:10px;">将在新窗口打开，可随时关闭后重新点击进入</div>
-      </div>\` : ''}
-      \${build.status === 'success' && build.download_url ? \`<div class="links"><a href="\${escapeHtml(build.download_url)}" target="_blank" rel="noopener">下载编译产物 →</a></div>\` : ''}
-      \${build.status === 'failed' ? \`<div class="hint" style="color:var(--bad);margin-top:10px;">编译失败，可在编译记录中查看详情</div>\` : ''}
-      \${canCancel ? \`<div style="margin-top:16px;"><button class="ghost small" id="watch-cancel-btn" style="color:var(--bad);">取消编译</button></div>\` : ''}
-    </div>\`;
-    if (canCancel) {
-      qs(container, '#watch-cancel-btn').addEventListener('click', () => {
-        cancelBuildWithConfirm(build.id, async () => {
-          try { const res = await api.getBuild(build.id); renderBuildWatchCard(container, res.build); } catch {}
-        });
-      });
-    }
   }
   
   async function renderBuildsPage() {
@@ -2651,6 +3003,7 @@ function json(data, status = 200, extraHeaders = {}) {
       <div class="links">
         \${b.web_url ? \`<a href="\${escapeHtml(b.web_url)}" target="_blank" rel="noopener">打开网页终端 →</a>\` : ''}
         \${b.download_url ? \`<a href="\${escapeHtml(b.download_url)}" target="_blank" rel="noopener">下载产物 →</a>\` : ''}
+        \${b.fail_reason || b.log_tail ? \`<details style="width:100%"><summary class="hint">失败原因</summary><pre class="fail-log">\${escapeHtml((b.fail_reason || '') + ' ' + (b.log_tail || ''))}</pre></details>\` : ''}
         \${ACTIVE_BUILD_STATUSES.includes(b.status) ? \`<button class="ghost small cancel-build-btn" style="color:var(--bad);margin-left:auto;">取消编译</button>\` : ''}
       </div>
     </div>\`).join('');
@@ -2663,6 +3016,469 @@ function json(data, status = 200, extraHeaders = {}) {
     });
   }
   
+  const STORE = { loaded: false, catalog: [], projects: [], plat: { status: 'none', list: [], err: '', fetched: '' }, cur: { id: '', subs: [], status: 'none', err: '', fetched: '' }, sel: new Set(['luci-app-store']), cat: '全部', q: '', pi: 0, target: 'x86', sub: '64', profile: 'generic', devQ: '', editId: null, tplName: '', nameDirty: false, stale: [], busy: false, limit: 48, only: false, cats: ['全部'], kw: {}, meta: '', refresh: false, seq: 0 };
+  const STORE_PRESETS = { '旁路由': ['luci-app-store', 'luci-app-passwall', 'luci-app-smartdns', 'luci-app-ttyd'], '家庭全能': ['luci-app-store', 'luci-app-openclash', 'luci-app-adblock-fast', 'luci-app-samba4', 'luci-app-qbittorrent', 'luci-app-ddns-go', 'luci-app-upnp', 'luci-theme-argon'], '极简': ['luci-app-store'] };
+  const STORE_TARGET_RE = new RegExp('^[A-Za-z0-9_+-][A-Za-z0-9_.+-]*/[A-Za-z0-9_+-][A-Za-z0-9_.+-]*$');
+  const STORE_PROFILE_RE = new RegExp('^[A-Za-z0-9_.+-]+$');
+  function storeHue(id) { let h = 0; for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) % 360; return h; }
+  function storeOrigin(p) {
+    const o = p.origin || { type: 'builtin' };
+    if (o.type === 'git') return { name: o.name, git_url: o.url, sparse: !!o.sparse, branch: o.branch || '', dirs: o.dirs || [] };
+    if (o.type === 'feed') return { name: o.name, feed: o.line };
+    return null;
+  }
+  function storeBy(id) { return STORE.catalog.find(function (p) { return p.id === id; }); }
+  function storeSelected() { return Array.from(STORE.sel).map(storeBy).filter(Boolean); }
+  function storeToggle(id) { if (STORE.sel.has(id)) STORE.sel.delete(id); else STORE.sel.add(id); storeDrawGrid(); storeDrawBasket(); }
+  function storeProject() { return STORE.projects[STORE.pi] || STORE.projects[0]; }
+  function storeTargetStr() { return STORE.target && STORE.sub ? STORE.target + '/' + STORE.sub : ''; }
+  function storeSubs() { return STORE.cur.id === STORE.target ? STORE.cur.subs : []; }
+  function storeCurSub() { return storeSubs().find(function (x) { return x.id === STORE.sub; }); }
+  function storeDevices() { const x = storeCurSub(); return x ? x.devices : []; }
+  function storeErr(e) { return (e && e.message) ? e.message : '读取失败'; }
+  function storeOpt(v, label, sel) { return '<option value="' + escapeHtml(v) + '"' + (sel ? ' selected' : '') + '>' + escapeHtml(label) + '</option>'; }
+
+  // 应用插件目录。编辑模板时，目录里已经没有的插件会作为「目录已无」条目保留，避免保存时被悄悄丢掉
+  function storeApplyCatalog(d) {
+    STORE.catalog = d.plugins.filter(function (p) { return !p.hidden; });
+    STORE.kw = {}; d.categories.forEach(function (c) { STORE.kw[c.id] = c.keywords || ''; });
+    STORE.cats = ['全部'].concat(d.categories.slice().sort(function (a, b) { return a.order - b.order; }).map(function (c) { return c.id; }).filter(function (c) { return STORE.catalog.some(function (p) { return p.cat === c; }); }));
+    STORE.stale.forEach(function (p) { if (!storeBy(p.id)) STORE.catalog.push(p); if (STORE.cats.indexOf(p.cat) < 0) STORE.cats.push(p.cat); });
+    STORE.meta = '目录更新于 ' + (d.updated || '未知') + '，' + (d.source === 'remote' ? '来自你的仓库 catalog.json' : '使用内置目录');
+    STORE.loaded = true;
+  }
+  async function storeReloadCatalog() { storeApplyCatalog(await api.get('/api/catalog')); }
+
+  function storeReset() {
+    STORE.sel = new Set(['luci-app-store']); STORE.target = 'x86'; STORE.sub = '64'; STORE.profile = 'generic'; STORE.devQ = '';
+    STORE.editId = null; STORE.tplName = ''; STORE.nameDirty = false; STORE.stale = [];
+    STORE.q = ''; STORE.cat = '全部'; STORE.only = false; STORE.limit = 48;
+  }
+
+  function storeSynth(id, plugins) {
+    let origin = { type: 'builtin' };
+    (plugins || []).forEach(function (p) {
+      if (p.feed) return;
+      if (p.sparse && (p.dirs || []).some(function (d) { return d.split('/').pop() === id; })) origin = { type: 'git', name: id, url: p.git_url, branch: p.branch || '', sparse: true, dirs: (p.dirs || []).filter(function (d) { return d.split('/').pop() === id; }) };
+      else if (!p.sparse && p.name === id) origin = { type: 'git', name: id, url: p.git_url, branch: p.branch || '', sparse: false, dirs: [] };
+    });
+    return { id: id, name: id, desc: origin.type === 'builtin' ? '插件目录里已经没有这一项，仍会按包名尝试启用。' : '模板里保存的第三方插件，不在当前目录里。', desc_en: '', cat: '自定义', kind: 'app', origin: origin, deps: [], requires: [], size_mb: null, rec: false, tut: '', tags: [], hidden: false, custom: origin.type !== 'builtin', stale: true };
+  }
+
+  // 编辑模板：把模板里保存的源码、平台、机型、插件选择回填到商店
+  async function storeEnterEdit(id) {
+    const t = (await api.getTemplate(id)).template;
+    storeReset();
+    STORE.editId = t.id; STORE.tplName = t.name; STORE.nameDirty = true;
+    let i = STORE.projects.findIndex(function (p) { return t.project_id && p.id === t.project_id; });
+    if (i < 0) i = STORE.projects.findIndex(function (p) { return p.repo_url === t.repo_url && p.branch === t.branch; });
+    if (i < 0) {
+      toast('这个模板用的源码项目已不在列表里，请重新选择源码、平台和机型', 'error');
+      STORE.target = ''; STORE.sub = ''; STORE.profile = '';
+    } else {
+      STORE.pi = i;
+      const tp = String(t.target || '').split('/');
+      STORE.target = tp[0] || ''; STORE.sub = tp[1] || ''; STORE.profile = t.profile || '';
+    }
+    const ids = (t.selection && t.selection.length) ? t.selection : (t.packages || []).filter(function (x) { return !!storeBy(x); });
+    STORE.sel = new Set(ids);
+    STORE.stale = [];
+    ids.forEach(function (x) { if (!storeBy(x)) { const p = storeSynth(x, t.plugins); STORE.stale.push(p); STORE.catalog.push(p); if (STORE.cats.indexOf(p.cat) < 0) STORE.cats.push(p.cat); } });
+  }
+
+  async function storeLoadProjects() {
+    const pj = await api.get('/api/projects');
+    STORE.projects = pj.projects;
+    if (STORE.pi >= STORE.projects.length) STORE.pi = 0;
+  }
+
+  // 平台列表：Worker 实时从源码仓库的 target/linux 读取
+  async function storeLoadPlatforms(force) {
+    const p = storeProject(), seq = ++STORE.seq;
+    STORE.plat = { status: 'loading', list: [], err: '', fetched: '' };
+    STORE.cur = { id: '', subs: [], status: 'none', err: '', fetched: '' };
+    storeDrawSelects(); storeDrawHint();
+    try {
+      const d = await api.get('/api/platforms?project=' + encodeURIComponent(p.id) + (force ? '&refresh=1' : ''));
+      if (seq !== STORE.seq) return;
+      STORE.plat = { status: 'ready', list: d.platforms, err: '', fetched: d.fetched_at || '' };
+    } catch (e) {
+      if (seq !== STORE.seq) return;
+      STORE.plat = { status: 'error', list: [], err: storeErr(e), fetched: '' };
+    }
+    if (STORE.plat.status === 'ready' && !STORE.plat.list.some(function (x) { return x.id === STORE.target; })) { STORE.target = ''; STORE.sub = ''; STORE.profile = ''; }
+    storeDrawSelects(); storeDrawHint(); storeDrawBasket();
+    if (STORE.plat.status === 'ready' && STORE.target) storeLoadPlatform(STORE.target, force);
+  }
+
+  // 单个平台：子平台和机型（解析该平台 image 目录下的 *.mk）
+  async function storeLoadPlatform(t, force) {
+    const p = storeProject(), seq = ++STORE.seq;
+    STORE.cur = { id: t, subs: [], status: 'loading', err: '', fetched: '' };
+    storeDrawSelects(); storeDrawHint();
+    try {
+      const d = await api.get('/api/platform?project=' + encodeURIComponent(p.id) + '&target=' + encodeURIComponent(t) + (force ? '&refresh=1' : ''));
+      if (seq !== STORE.seq) return;
+      STORE.cur = { id: t, subs: d.subtargets, status: 'ready', err: '', fetched: d.fetched_at || '' };
+      if (!STORE.sub) {
+        const pick = d.subtargets.find(function (x) { return x.id === '64'; }) || d.subtargets[0];
+        STORE.sub = pick.id; STORE.profile = '';
+        const g = pick.devices.find(function (x) { return x.id === 'generic'; });
+        if (g) STORE.profile = g.id;
+      } else if (!storeCurSub()) {
+        toast('原来的子平台 ' + STORE.sub + ' 在当前源码里找不到，请重新选择子平台和机型', 'error');
+        STORE.sub = ''; STORE.profile = '';
+      }
+    } catch (e) {
+      if (seq !== STORE.seq) return;
+      STORE.cur = { id: t, subs: [], status: 'error', err: storeErr(e), fetched: '' };
+    }
+    storeDrawSelects(); storeDrawHint(); storeDrawBasket();
+  }
+
+  // 平台 / 子平台 / 机型只能从下拉框里选；机型很多，旁边的输入框只用来筛选选项
+  function storeDrawSelects() {
+    const a = document.getElementById('st-tgt'), b = document.getElementById('st-sub'), c = document.getElementById('st-dev');
+    if (!a || !b || !c) return;
+    let h;
+    if (STORE.plat.status === 'loading') h = storeOpt('', '读取平台中…', true);
+    else if (STORE.plat.status === 'error') h = storeOpt('', '读取失败，请点下方重试', true);
+    else h = storeOpt('', '— 请选择平台 —', !STORE.target) + STORE.plat.list.map(function (t) { return storeOpt(t.id, t.id, t.id === STORE.target); }).join('');
+    a.innerHTML = h; a.disabled = STORE.plat.status !== 'ready';
+    const subs = storeSubs();
+    if (STORE.cur.status === 'loading') h = storeOpt('', '读取机型中…', true);
+    else if (!subs.length) h = storeOpt('', STORE.target ? '（没有可选项）' : '— 先选平台 —', true);
+    else h = storeOpt('', '— 请选择子平台 —', !STORE.sub) + subs.map(function (x) { return storeOpt(x.id, x.id + (x.name && x.name !== x.id ? ' · ' + x.name : '') + (x.arch ? ' · ' + x.arch : ''), x.id === STORE.sub); }).join('');
+    b.innerHTML = h; b.disabled = !subs.length;
+    const devs = storeDevices(), q = (STORE.devQ || '').trim().toLowerCase();
+    const shown = devs.filter(function (d) { return !q || d.id === STORE.profile || (d.name + ' ' + d.id + ' ' + (d.alt || []).join(' ')).toLowerCase().indexOf(q) >= 0; });
+    if (!devs.length) h = storeOpt('', STORE.sub ? '（没有可选机型）' : '— 先选子平台 —', true);
+    else {
+      h = storeOpt('', '— 请选择机型（共 ' + devs.length + ' 个' + (q ? '，筛出 ' + shown.length + ' 个' : '') + '）—', !STORE.profile);
+      if (STORE.profile && !devs.some(function (d) { return d.id === STORE.profile; })) h += storeOpt(STORE.profile, STORE.profile + '（不在源码机型列表里）', true);
+      h += shown.map(function (d) { return storeOpt(d.id, d.name + (d.name !== d.id ? '  ·  ' + d.id : ''), d.id === STORE.profile); }).join('');
+    }
+    c.innerHTML = h; c.disabled = !devs.length;
+    const q2 = document.getElementById('st-devq'); if (q2) q2.disabled = !devs.length;
+  }
+  function storeSyncInputs() { storeDrawSelects(); }
+
+  function storeDrawHint() {
+    const el = document.getElementById('st-devhint'); if (!el) return;
+    const p = storeProject(), btn = ' <button class="ghost small" id="st-devrefresh">';
+    if (STORE.plat.status === 'loading') { el.textContent = '正在从源码仓库读取平台列表…'; return; }
+    if (STORE.plat.status === 'error') { el.innerHTML = escapeHtml('读取失败：' + STORE.plat.err + '。读取成功后才能选择平台和机型。') + btn + '重试</button>'; return; }
+    if (STORE.cur.status === 'loading') { el.textContent = '正在读取 ' + STORE.cur.id + ' 的机型（实时解析源码，首次约几秒）…'; return; }
+    if (STORE.cur.status === 'error') { el.innerHTML = escapeHtml('读取 ' + STORE.cur.id + ' 失败：' + STORE.cur.err) + btn + '重试</button>'; return; }
+    if (STORE.plat.status === 'ready') el.innerHTML = escapeHtml('平台和机型由 Worker 实时读取自 ' + p.repo_url.replace('https://github.com/', '') + ' @ ' + p.branch + '，结果缓存 7 天' + (STORE.cur.fetched ? '（' + STORE.cur.fetched + '）' : '')) + btn + '刷新</button>';
+  }
+
+  // 自定义插件：填仓库地址 → 识别 → 添加后和目录里的插件一起出现在商店
+  function storeCustomPluginModal() {
+    function listHtml() {
+      const c = STORE.catalog.filter(function (p) { return p.custom && !p.stale; });
+      return c.length ? c.map(function (p) {
+        const o = p.origin || {};
+        return '<div style="display:flex;gap:8px;align-items:center;padding:6px 0;border-bottom:1px solid var(--border)"><div style="flex:1;min-width:0"><b>' + escapeHtml(p.name) + '</b> <code class="hint">' + escapeHtml(p.id) + '</code><div class="hint" style="word-break:break-all">' + escapeHtml((o.url || '') + (o.sparse && o.dirs ? ' · ' + o.dirs.join(', ') : '')) + '</div></div><button class="ghost small" data-cpdel="' + escapeHtml(p.id) + '">删除</button></div>';
+      }).join('') : '<div class="hint">还没有自定义插件</div>';
+    }
+    const m = el('<div class="modal-backdrop" style="position:fixed;inset:0;background:rgba(0,0,0,.45);display:grid;place-items:center;z-index:50;padding:16px"><div style="background:var(--panel);border-radius:14px;padding:20px;width:min(560px,94vw);max-height:90vh;overflow:auto"><h2 style="margin:0 0 4px">添加自定义插件</h2>'
+      + '<div class="hint">填写插件源码的 GitHub 仓库地址，识别后添加到商店，勾选即可使用。整个仓库是一个包，或仓库里有多个包，都可以。</div>'
+      + '<div class="st-warn" style="margin-top:8px">编译时会运行这个仓库里的代码，请只添加你信任的仓库。</div>'
+      + '<label style="display:block;margin-top:12px">仓库地址<input id="cp-url" placeholder="https://github.com/用户/仓库" style="width:100%"></label>'
+      + '<label style="display:block;margin-top:8px">分支（留空使用默认分支）<input id="cp-branch" style="width:100%"></label>'
+      + '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px"><button class="primary" id="cp-detect">识别</button></div>'
+      + '<div id="cp-res" style="margin-top:10px"></div>'
+      + '<h3 style="margin:16px 0 4px;font-size:14px">已添加的自定义插件</h3><div id="cp-list">' + listHtml() + '</div>'
+      + '<div style="text-align:right;margin-top:14px"><button class="ghost" id="cp-close">关闭</button></div></div></div>');
+    document.body.appendChild(m);
+    const res = m.querySelector('#cp-res');
+    let det = null;
+    function manualForm(note) {
+      res.innerHTML = (note ? '<div class="hint">' + escapeHtml(note) + '</div>' : '')
+        + '<label style="display:block;margin-top:8px">包名（CONFIG_PACKAGE_ 后面的名字，如 luci-app-xxx）<input id="cp-id" style="width:100%"></label>'
+        + '<label style="display:block;margin-top:8px">显示名称（可选）<input id="cp-name" style="width:100%"></label>'
+        + '<label style="display:block;margin-top:8px">简介（可选）<input id="cp-desc" style="width:100%"></label>'
+        + '<label style="display:block;margin-top:8px">额外需要的包（可选，逗号分隔）<input id="cp-req" style="width:100%"></label>'
+        + '<div style="text-align:right;margin-top:10px"><button class="primary" id="cp-add-one">添加</button></div>';
+    }
+    async function after(r) {
+      await storeReloadCatalog();
+      (r.plugins || []).forEach(function (p) { STORE.sel.add(p.id); });
+      STORE.cat = '自定义'; STORE.only = false; STORE.q = ''; STORE.limit = 48;
+      const qi = document.getElementById('st-q'); if (qi) qi.value = '';
+      storeDrawGrid(); storeDrawBasket();
+      m.querySelector('#cp-list').innerHTML = listHtml();
+      res.innerHTML = '';
+      toast('已添加 ' + (r.plugins || []).length + ' 个，并已加入已选', 'success');
+    }
+    m.querySelector('#cp-close').onclick = function () { m.remove(); };
+    m.querySelector('#cp-detect').onclick = async function () {
+      const url = m.querySelector('#cp-url').value.trim(), br = m.querySelector('#cp-branch').value.trim();
+      if (!url) { toast('请填写仓库地址', 'error'); return; }
+      res.innerHTML = '<div class="hint">正在识别…</div>';
+      try {
+        det = await api.post('/api/custom-plugins/detect', { repo_url: url, branch: br });
+        if (!det.detected) { manualForm(det.reason); return; }
+        if (det.root) {
+          manualForm('识别为单个插件包。');
+          m.querySelector('#cp-id').value = det.pkg_name;
+        } else if (det.candidates.length) {
+          res.innerHTML = '<div class="hint">这个仓库里有多个包，勾选要添加的（共 ' + det.candidates.length + ' 个' + (det.truncated ? '，仓库太大，列表可能不完整' : '') + '）：</div>'
+            + '<input id="cp-filter" type="search" placeholder="筛选" style="width:100%;margin:6px 0">'
+            + '<div id="cp-cands" style="max-height:220px;overflow:auto;border:1px solid var(--border);border-radius:8px;padding:4px 8px">'
+            + det.candidates.map(function (c) { return '<label class="cp-cand" style="display:flex;gap:8px;padding:3px 0;font-size:13px"><input type="checkbox" data-path="' + escapeHtml(c.path) + '" style="width:auto"><span>' + escapeHtml(c.path) + '</span></label>'; }).join('') + '</div>'
+            + '<div style="text-align:right;margin-top:10px"><button class="primary" id="cp-add-dirs">添加所选</button></div>';
+          m.querySelector('#cp-filter').oninput = function (e) {
+            const q = e.target.value.trim().toLowerCase();
+            Array.prototype.forEach.call(m.querySelectorAll('.cp-cand'), function (l) { l.style.display = (!q || l.textContent.toLowerCase().indexOf(q) >= 0) ? 'flex' : 'none'; });
+          };
+        } else {
+          manualForm('没有在仓库里找到 Makefile，它可能不是 OpenWrt 软件包仓库。如果确定是，可以手动填写包名。');
+        }
+      } catch (e) { res.innerHTML = ''; reportApiError(e, '识别失败'); }
+    };
+    m.addEventListener('click', async function (e) {
+      const b = e.target; if (!b || !b.id && !(b.dataset && b.dataset.cpdel)) return;
+      const url = m.querySelector('#cp-url').value.trim(), br = (det && det.branch) || m.querySelector('#cp-branch').value.trim();
+      try {
+        if (b.id === 'cp-add-one') {
+          const body = { repo_url: url, branch: br, id: m.querySelector('#cp-id').value.trim(), name: m.querySelector('#cp-name').value.trim(), desc: m.querySelector('#cp-desc').value.trim(), requires: m.querySelector('#cp-req').value.split(',').map(function (x) { return x.trim(); }).filter(Boolean) };
+          await after(await api.post('/api/custom-plugins', body));
+        } else if (b.id === 'cp-add-dirs') {
+          const dirs = Array.prototype.map.call(m.querySelectorAll('#cp-cands input:checked'), function (x) { return x.dataset.path; });
+          if (!dirs.length) { toast('请先勾选要添加的包', 'error'); return; }
+          await after(await api.post('/api/custom-plugins', { repo_url: url, branch: br, dirs: dirs }));
+        } else if (b.dataset && b.dataset.cpdel) {
+          await api.del('/api/custom-plugins/' + encodeURIComponent(b.dataset.cpdel));
+          STORE.sel.delete(b.dataset.cpdel);
+          await storeReloadCatalog(); storeDrawGrid(); storeDrawBasket();
+          m.querySelector('#cp-list').innerHTML = listHtml();
+        }
+      } catch (err) { reportApiError(err, '操作失败'); }
+    });
+  }
+
+  async function renderStorePage(tplId) {
+    const app = document.getElementById('app');
+    app.innerHTML = '<div id="toast-wrap" class="toast-wrap"></div>' + renderTopbar('store') + '<div class="content"><div id="store-area"><div class="hint">加载中…</div></div></div>';
+    bindTopbar(app);
+    try {
+      if (!STORE.loaded) {
+        storeApplyCatalog(await api.get('/api/catalog' + (STORE.refresh ? '?refresh=1' : '')));
+        STORE.refresh = false;
+      }
+      await storeLoadProjects();
+      if (tplId) { if (STORE.editId !== tplId) await storeEnterEdit(tplId); }
+      else if (STORE.editId) storeReset();
+    } catch (e) {
+      reportApiError(e, '加载失败');
+      if (tplId) navigate('#/templates');
+      return;
+    }
+    const editing = !!STORE.editId;
+    const area = document.getElementById('store-area');
+    area.innerHTML = (editing ? '<div class="detail-back"><button class="ghost small" id="st-back">‹ 返回模板</button></div>' : '')
+      + '<div class="page-head"><div><h1>' + (editing ? '编辑模板的机型和插件' : '插件商店') + '</h1><div class="hint">' + (editing ? '改完点右侧「保存到模板」，回到模板页再确认和编译。' : '选好设备和插件，点「生成模板」，到模板页确认无误后再编译。') + '</div><div class="hint">' + escapeHtml(STORE.meta) + ' <button class="ghost small" id="st-refresh">刷新目录</button></div></div></div>'
+      + '<div class="st-bar"><div class="st-field"><label>项目（源码）<select id="st-src"></select></label></div>'
+      + '<div class="st-field"><label>平台<select id="st-tgt"></select></label></div>'
+      + '<div class="st-field"><label>子平台<select id="st-sub"></select></label></div>'
+      + '<div class="st-field"><label>机型<select id="st-dev"></select></label><input id="st-devq" type="search" autocomplete="off" placeholder="筛选机型，如 RAX3000M" style="margin-top:6px"><div class="hint" id="st-profhint"></div></div></div>'
+      + '<div class="hint" id="st-devhint" style="margin:-8px 0 14px"></div>'
+      + '<div class="st-layout"><div><div class="st-presets">一键方案：' + Object.keys(STORE_PRESETS).map(function (k) { return '<button class="ghost small" data-preset="' + k + '">' + k + '</button>'; }).join('') + '</div>'
+      + '<div class="st-tools"><input id="st-q" type="search" placeholder="搜索插件，如 广告、下载、代理" value="' + escapeHtml(STORE.q) + '"><button class="ghost" id="st-addcp">＋ 自定义插件</button></div>'
+      + '<div class="st-chips" id="st-chips"></div><div class="st-grid" id="st-grid"></div><div style="text-align:center;margin:14px" id="st-more"></div></div><aside class="st-basket" id="st-basket"></aside></div>';
+    storeDrawProjects();
+    document.getElementById('st-src').onchange = function (e) {
+      if (e.target.value === 'new') { e.target.value = String(STORE.pi); storeProjectModal(); return; }
+      STORE.pi = +e.target.value; storeLoadPlatforms(false);
+    };
+    document.getElementById('st-tgt').onchange = function (e) {
+      STORE.target = e.target.value; STORE.sub = ''; STORE.profile = ''; STORE.devQ = '';
+      const q = document.getElementById('st-devq'); if (q) q.value = '';
+      if (STORE.target) storeLoadPlatform(STORE.target, false);
+      else { STORE.cur = { id: '', subs: [], status: 'none', err: '', fetched: '' }; storeDrawSelects(); storeDrawHint(); storeDrawBasket(); }
+    };
+    document.getElementById('st-sub').onchange = function (e) {
+      STORE.sub = e.target.value; STORE.profile = ''; STORE.devQ = '';
+      const q = document.getElementById('st-devq'); if (q) q.value = '';
+      storeDrawSelects(); storeDrawBasket();
+    };
+    document.getElementById('st-dev').onchange = function (e) { STORE.profile = e.target.value; storeDrawSelects(); storeDrawBasket(); };
+    document.getElementById('st-devq').oninput = function (e) { STORE.devQ = e.target.value; storeDrawSelects(); };
+    document.getElementById('st-q').oninput = function (e) { STORE.q = e.target.value.trim().toLowerCase(); STORE.limit = 48; storeDrawGrid(); };
+    area.addEventListener('click', function (e) {
+      const t = e.target;
+      if (t.dataset.preset) { STORE.sel = new Set(STORE_PRESETS[t.dataset.preset].filter(function (id) { return !!storeBy(id); })); storeDrawGrid(); storeDrawBasket(); return; }
+      if (t.dataset.cat) { STORE.cat = t.dataset.cat; STORE.limit = 48; STORE.only = false; storeDrawGrid(); return; }
+      if (t.dataset.only) { STORE.only = !STORE.only; STORE.limit = 48; storeDrawGrid(); return; }
+      if (t.dataset.more) { STORE.limit += 48; storeDrawGrid(); return; }
+      if (t.dataset.rm) { storeToggle(t.dataset.rm); return; }
+      if (t.dataset.add) { storeToggle(t.dataset.add); return; }
+      if (t.id === 'st-devrefresh') { storeLoadPlatforms(true); return; }
+      if (t.id === 'st-refresh') { STORE.loaded = false; STORE.refresh = true; renderStorePage(tplId); return; }
+      if (t.id === 'st-addcp') { storeCustomPluginModal(); return; }
+      if (t.id === 'st-back') { storeReset(); navigate('#/template/' + tplId); return; }
+      if (t.id === 'st-go') { storeSave(); return; }
+      const c = t.closest ? t.closest('.st-card') : null;
+      if (c) storeDetail(c.dataset.id);
+    });
+    storeDrawSelects(); storeDrawHint(); storeDrawGrid(); storeDrawBasket();
+    storeLoadPlatforms(false);
+  }
+
+  function storeDrawProjects() {
+    const sel = document.getElementById('st-src'); if (!sel) return;
+    sel.innerHTML = STORE.projects.map(function (p, i) { return '<option value="' + i + '"' + (i === STORE.pi ? ' selected' : '') + '>' + escapeHtml((p.builtin ? '' : '★ ') + p.name) + '</option>'; }).join('') + '<option value="new">＋ 添加 / 管理自定义项目…</option>';
+  }
+
+  function storeProjectModal() {
+    function rows() {
+      const c = STORE.projects.filter(function (p) { return !p.builtin; });
+      return c.length ? c.map(function (p) { return '<div style="display:flex;gap:8px;align-items:center;padding:6px 0;border-bottom:1px solid var(--border)"><div style="flex:1;min-width:0"><b>' + escapeHtml(p.name) + '</b><div class="hint" style="word-break:break-all">' + escapeHtml(p.repo_url + ' @ ' + p.branch) + '</div></div><button class="ghost small" data-pr="del" data-id="' + p.id + '">删除</button></div>'; }).join('') : '<div class="hint">还没有自定义项目</div>';
+    }
+    const m = el('<div class="modal-backdrop" style="position:fixed;inset:0;background:rgba(0,0,0,.45);display:grid;place-items:center;z-index:50;padding:16px"><div style="background:var(--panel);border-radius:14px;padding:20px;width:min(520px,94vw);max-height:90vh;overflow:auto"><h2 style="margin:0 0 4px">自定义项目</h2><div class="hint">填写你的 OpenWrt / ImmortalWrt / LEDE 或其它 OpenWrt 系源码的 GitHub 仓库和分支，添加时会立即检查，平台和机型直接从仓库源码读取。</div>'
+      + '<label style="display:block;margin-top:12px">项目名称<input id="pj-name" placeholder="如 我的 ImmortalWrt" style="width:100%"></label>'
+      + '<label style="display:block;margin-top:8px">仓库地址<input id="pj-url" placeholder="https://github.com/用户/仓库" style="width:100%"></label>'
+      + '<label style="display:block;margin-top:8px">分支<input id="pj-branch" value="master" style="width:100%"></label>'
+      + '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px"><button class="primary" id="pj-add">添加</button></div>'
+      + '<h3 style="margin:16px 0 4px;font-size:14px">已添加</h3><div id="pj-list">' + rows() + '</div>'
+      + '<div style="text-align:right;margin-top:14px"><button class="ghost" id="pj-close">关闭</button></div></div></div>');
+    document.body.appendChild(m);
+    async function refreshList() { await storeLoadProjects(); storeDrawProjects(); m.querySelector('#pj-list').innerHTML = rows(); }
+    m.querySelector('#pj-close').onclick = function () { m.remove(); };
+    m.querySelector('#pj-add').onclick = async function () {
+      const body = { name: m.querySelector('#pj-name').value.trim(), repo_url: m.querySelector('#pj-url').value.trim(), branch: m.querySelector('#pj-branch').value.trim() };
+      try {
+        const r = await api.post('/api/projects', body);
+        await refreshList();
+        STORE.pi = Math.max(0, STORE.projects.findIndex(function (p) { return p.id === r.project.id; }));
+        storeDrawProjects(); m.remove(); toast('已添加，正在读取平台列表', 'success');
+        STORE.target = ''; STORE.sub = ''; STORE.profile = ''; STORE.devText = ''; storeSyncInputs(); storeLoadPlatforms(false);
+      } catch (e) { reportApiError(e, '添加失败'); }
+    };
+    m.addEventListener('click', async function (e) {
+      const b = e.target; if (!b.dataset || b.dataset.pr !== 'del') return;
+      try { await api.del('/api/projects/' + b.dataset.id); await refreshList(); STORE.pi = 0; storeDrawProjects(); storeLoadPlatforms(false); }
+      catch (err) { reportApiError(err, '删除失败'); }
+    });
+  }
+
+  function storeDrawGrid() {
+    document.getElementById('st-chips').innerHTML = STORE.cats.map(function (c) {
+      const n = c === '全部' ? STORE.catalog.length : STORE.catalog.filter(function (p) { return p.cat === c; }).length;
+      return '<button class="ghost small" data-cat="' + c + '" aria-pressed="' + (!STORE.only && c === STORE.cat) + '">' + c + ' ' + n + '</button>';
+    }).join('') + '<button class="ghost small" data-only="1" aria-pressed="' + STORE.only + '">只看已选 ' + STORE.sel.size + '</button>';
+    const L = STORE.catalog.filter(function (p) {
+      if (STORE.only) return STORE.sel.has(p.id);
+      return (STORE.cat === '全部' || p.cat === STORE.cat) && (p.name + ' ' + p.desc + ' ' + p.id + ' ' + p.cat + ' ' + (STORE.kw[p.cat] || '') + ' ' + (p.tags || []).join(' ')).toLowerCase().indexOf(STORE.q) >= 0;
+    });
+    document.getElementById('st-grid').innerHTML = L.length ? L.slice(0, STORE.limit).map(function (p) {
+      const on = STORE.sel.has(p.id);
+      return '<article class="st-card" data-id="' + p.id + '"><div class="st-top"><div class="st-tile" style="background:hsl(' + storeHue(p.id) + ' 52% 40%)">' + escapeHtml(p.name.charAt(0).toUpperCase()) + '</div><div><h3>' + escapeHtml(p.name) + '</h3><code>' + p.id + '</code></div></div>'
+        + '<p>' + escapeHtml(p.desc) + '</p><div class="st-foot">' + (p.rec ? '<span class="badge dim">推荐内置</span>' : '') + (p.stale ? '<span class="badge warn">目录已无</span>' : (p.custom ? '<span class="badge dim">自定义</span>' : ((p.origin && p.origin.type !== 'builtin') ? '<span class="badge dim">第三方源</span>' : ''))) + '<span>' + (p.size_mb ? '约 ' + p.size_mb + ' MB' : '') + '</span>'
+        + '<button class="small ' + (on ? 'on' : 'ghost') + '" data-add="' + p.id + '">' + (on ? '已添加' : '添加') + '</button></div></article>';
+    }).join('') : '<div class="hint">没有匹配的插件，换个关键词或分类试试。</div>';
+    document.getElementById('st-more').innerHTML = L.length > STORE.limit ? '<button class="ghost" data-more="1">显示更多（还有 ' + (L.length - STORE.limit) + ' 个）</button>' : '';
+  }
+
+  function storeConfigPreview() {
+    const NL = String.fromCharCode(10), lines = [];
+    if (STORE.profile && STORE_TARGET_RE.test(storeTargetStr())) { const m = storeTargetStr().split('/'); lines.push('CONFIG_TARGET_' + m[0] + '=y', 'CONFIG_TARGET_' + m[0] + '_' + m[1] + '=y', 'CONFIG_TARGET_' + m[0] + '_' + m[1] + '_DEVICE_' + STORE.profile + '=y'); }
+    storeSelected().forEach(function (p) { lines.push('CONFIG_PACKAGE_' + p.id + '=y'); (p.requires || []).forEach(function (r) { lines.push('CONFIG_PACKAGE_' + r + '=y'); }); });
+    return lines.join(NL);
+  }
+
+  function storeAutoName() {
+    const proj = storeProject();
+    return '商店 · ' + (proj ? proj.name : '') + ' · ' + (storeTargetStr() || '未选平台') + ' · ' + (STORE.profile || '未选机型');
+  }
+
+  function storeDrawBasket() {
+    const box = document.getElementById('st-basket'); if (!box) return;
+    const ph = document.getElementById('st-profhint');
+    if (ph) ph.textContent = STORE.profile ? 'profile：' + STORE.profile : '';
+    const S = storeSelected(), mb = 7 + S.reduce(function (a, p) { return a + (p.size_mb || 0); }, 0);
+    const deps = new Set(); S.forEach(function (p) { (p.deps || []).forEach(function (d) { deps.add(d); }); });
+    const px = S.filter(function (p) { return p.cat === '代理'; });
+    const warns = [];
+    if (px.length > 1) warns.push('已选 ' + px.length + ' 个代理插件，通常只需要一个，同时启用容易冲突。');
+    if (!storeTargetStr() || !STORE_TARGET_RE.test(storeTargetStr())) warns.push('请先选择平台和子平台。');
+    else if (!STORE.profile) warns.push('请选择机型。');
+    if (STORE.profile && storeCurSub() && !storeDevices().some(function (d) { return d.id === STORE.profile; })) warns.push('这个机型不在所选子平台的源码列表里（模板里原有的值），建议重新选择。');
+    if (STORE.profile && !STORE_PROFILE_RE.test(STORE.profile)) warns.push('机型 profile 只能包含字母、数字和 . _ + -');
+    const nStale = S.filter(function (p) { return p.stale; }).length;
+    if (nStale) warns.push(nStale + ' 个插件已不在目录里，会按原包名尝试启用，编译时校验是否生效。');
+    const proj = storeProject();
+    const nm = STORE.nameDirty ? STORE.tplName : storeAutoName();
+    box.innerHTML = '<h2>固件清单</h2><div class="hint">' + escapeHtml((proj ? proj.name : '') + ' · ' + (storeTargetStr() || '未选平台') + ' · ' + (STORE.profile || '未选机型')) + '</div><ul>' + S.map(function (p) { return '<li>' + escapeHtml(p.name) + '<button data-rm="' + escapeHtml(p.id) + '" aria-label="移除">×</button></li>'; }).join('') + '</ul>'
+      + '<div class="st-sum"><span><b>' + S.length + '</b>插件</span><span><b>' + deps.size + '</b>自动依赖</span><span><b>' + mb.toFixed(1) + '</b>已知体积 MB</span></div>' + warns.map(function (w) { return '<div class="st-warn">' + escapeHtml(w) + '</div>'; }).join('')
+      + '<label class="hint" style="display:block">模板名称<input id="st-name" maxlength="80" value="' + escapeHtml(nm) + '" style="margin-top:4px"></label>'
+      + '<details><summary class="hint">查看将写入的配置行</summary><textarea readonly>' + escapeHtml(storeConfigPreview()) + '</textarea></details>'
+      + '<button class="primary" id="st-go"' + (STORE.busy ? ' disabled' : '') + '>' + (STORE.busy ? '保存中…' : (STORE.editId ? '保存到模板' : '生成模板')) + '</button>'
+      + '<div class="hint">不会立即编译，下一页确认后再点编译。</div>';
+    document.getElementById('st-name').oninput = function (e) { STORE.tplName = e.target.value; STORE.nameDirty = true; };
+  }
+
+  function storeDetail(id) {
+    const p = storeBy(id); if (!p) return;
+    const on = STORE.sel.has(id), o = storeOrigin(p);
+    const m = el('<div class="modal-backdrop" style="position:fixed;inset:0;background:rgba(0,0,0,.45);display:grid;place-items:center;z-index:50"><div style="background:var(--panel);border-radius:14px;padding:20px;width:min(460px,92vw)"><h2 style="margin:0">' + escapeHtml(p.name) + '</h2><code class="hint">' + p.id + '</code><p>' + escapeHtml(p.desc) + '</p>' + (p.tut ? '<p><b>使用提示：</b>' + escapeHtml(p.tut) + '</p>' : '') + '<p><b>依赖：</b>' + (p.deps.length ? escapeHtml(p.deps.join('、')) : '无') + '（由编译系统自动解决）</p>' + (o ? '<p><b>来源：</b>' + escapeHtml(o.git_url || o.feed) + '</p>' : '') + '<div style="display:flex;gap:8px;justify-content:flex-end"><button class="ghost" id="st-dx">关闭</button><button class="primary" id="st-da">' + (on ? '从固件移除' : '添加到固件') + '</button></div></div></div>');
+    document.body.appendChild(m);
+    m.querySelector('#st-dx').onclick = function () { m.remove(); };
+    m.querySelector('#st-da').onclick = function () { storeToggle(id); m.remove(); };
+  }
+
+  // 把所选插件的来源合并：同一个 feed 只写一次，同一个仓库的多个子目录合成一次稀疏克隆
+  function storeMergePlugins(S) {
+    const out = [], idx = {};
+    S.forEach(function (p) {
+      const o = storeOrigin(p); if (!o) return;
+      if (o.feed) { const k = 'f|' + o.feed; if (!idx[k]) { idx[k] = o; out.push(o); } return; }
+      if (o.sparse) {
+        const k = 's|' + o.git_url + '|' + o.branch;
+        if (idx[k]) { o.dirs.forEach(function (d) { if (idx[k].dirs.indexOf(d) < 0) idx[k].dirs.push(d); }); }
+        else { o.dirs = o.dirs.slice(); idx[k] = o; out.push(o); }
+        return;
+      }
+      const k = 'g|' + o.git_url + '|' + o.name;
+      if (!idx[k]) { idx[k] = o; out.push(o); }
+    });
+    return out;
+  }
+
+  // 只保存模板，不触发编译；保存后跳到模板页确认
+  async function storeSave() {
+    if (STORE.busy) return;
+    const proj = storeProject(), target = storeTargetStr(), profile = (STORE.profile || '').trim();
+    if (!STORE_TARGET_RE.test(target)) { toast('请先选择平台和子平台', 'error'); return; }
+    if (!profile) { toast('请选择机型', 'error'); return; }
+    if (!STORE_PROFILE_RE.test(profile)) { toast('机型 profile 格式不正确', 'error'); return; }
+    let name = (STORE.nameDirty ? STORE.tplName : storeAutoName()).trim();
+    if (!name) { toast('请填写模板名称', 'error'); return; }
+    const S = storeSelected(), pk = new Set();
+    S.forEach(function (p) { pk.add(p.id); (p.requires || []).forEach(function (r) { pk.add(r); }); });
+    const packages = Array.from(pk);
+    const selection = S.map(function (p) { return p.id; });
+    const plugins = storeMergePlugins(S);
+    STORE.busy = true; storeDrawBasket();
+    try {
+      const body = { name: name, repo_url: proj.repo_url, branch: proj.branch, target: target, profile: profile, project_id: proj.id, plugins: plugins, packages: packages, selection: selection };
+      let id = STORE.editId;
+      if (id) { await api.updateTemplate(id, body); }
+      else {
+        const lt = await api.listTemplates(), base = name; let n = 1;
+        while (lt.templates.some(function (x) { return x.name === name; })) { n++; name = base + ' (' + n + ')'; }
+        body.name = name;
+        id = (await api.createTemplate(body)).template.id;
+      }
+      const wasEdit = !!STORE.editId;
+      STORE.busy = false; storeReset();
+      toast(wasEdit ? '已保存到模板' : '模板已生成，请确认后再编译', 'success');
+      navigate('#/template/' + id);
+    } catch (e) { STORE.busy = false; reportApiError(e, '保存失败'); storeDrawBasket(); }
+  }
+
   async function bootAfterLogin() {
     try { const { templates } = await api.listTemplates(); store.templates = templates; } catch {}
     render();
@@ -2675,7 +3491,7 @@ function json(data, status = 200, extraHeaders = {}) {
     if (store.pollTimer) { clearInterval(store.pollTimer); store.pollTimer = null; }
     const { name, params } = store.route;
     if (name === 'template-detail') renderTemplateDetailPage(params.id);
-    else if (name === 'trigger') renderTriggerPage(params.id);
+    else if (name === 'store') renderStorePage(params.tpl);
     else if (name === 'builds') renderBuildsPage();
     else renderTemplatesPage();
   }
@@ -2725,6 +3541,7 @@ function json(data, status = 200, extraHeaders = {}) {
   // 主路由分发
   // ============================================================
   async function handleApiRequest(request, env, url) {
+    await ensureSchema(env);
     const path = url.pathname;
     const method = request.method;
   
@@ -2801,6 +3618,18 @@ function json(data, status = 200, extraHeaders = {}) {
       const m = path.match(/^\/api\/templates\/([^/]+)\/schedule$/);
       if (m && method === 'PUT') return handleSetSchedule(request, env, decodeURIComponent(m[1]));
     }
+    if (path === '/api/projects' && method === 'GET') return handleListProjects(env);
+    if (path === '/api/projects' && method === 'POST') return handleCreateProject(request, env);
+    const pjm = path.match(/^\/api\/projects\/([a-z0-9._-]+)$/);
+    if (pjm && method === 'DELETE') return handleDeleteProject(env, pjm[1]);
+    if (path === '/api/platforms' && method === 'GET') return handlePlatforms(env, url);
+    if (path === '/api/platform' && method === 'GET') return handlePlatform(env, url);
+    if (path === '/api/catalog' && method === 'GET') return handleCatalog(env, url);
+    if (path === '/api/custom-plugins' && method === 'GET') return handleListCustomPlugins(env);
+    if (path === '/api/custom-plugins' && method === 'POST') return handleCreateCustomPlugin(request, env);
+    if (path === '/api/custom-plugins/detect' && method === 'POST') return handleDetectCustomPlugin(request, env);
+    const cpm = path.match(/^\/api\/custom-plugins\/([A-Za-z0-9_.+-]+)$/);
+    if (cpm && method === 'DELETE') return handleDeleteCustomPlugin(env, cpm[1]);
     if (path === '/api/trigger' && method === 'POST') return handleTrigger(request, env);
     if (path === '/api/builds' && method === 'GET') return handleListBuilds(request, env, url);
     {
@@ -2831,6 +3660,6 @@ function json(data, status = 200, extraHeaders = {}) {
       });
     },
     async scheduled(event, env, ctx) {
-      ctx.waitUntil(runScheduledBuilds(env, event.cron));
+      ctx.waitUntil(ensureSchema(env).then(() => runScheduledBuilds(env, event.cron)));
     },
   };

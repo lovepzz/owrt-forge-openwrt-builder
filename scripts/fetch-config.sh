@@ -25,3 +25,6 @@ CFG_WORKER_URL=$(jq -r '.worker_url // ""' config.json)
 if [ -n "$CFG_WORKER_URL" ]; then
   echo "WORKER_URL=$CFG_WORKER_URL" >> "$GITHUB_ENV"
 fi
+
+# 新增：是否需要进入 menuconfig（商店直编或定时任务为 false）
+echo "menuconfig=$(jq -r 'if .menuconfig == false or .trigger_type == "scheduled" then "false" else "true" end' config.json)" >> "$GITHUB_OUTPUT"

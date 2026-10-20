@@ -1,0 +1,460 @@
+{
+  "_doc": "手工维护区：这里的改动会在每次同步后保留。字段说明见 CATALOG.md",
+  "upstream": {
+    "repo": "https://github.com/immortalwrt/luci",
+    "branch": "openwrt-24.10",
+    "dirs": {
+      "applications": "app",
+      "themes": "theme",
+      "protocols": "proto"
+    }
+  },
+  "categories": [
+    {
+      "id": "代理",
+      "order": 1,
+      "keywords": "科学 上网 翻墙 梯子 分流 订阅 节点"
+    },
+    {
+      "id": "DNS 与广告",
+      "order": 2,
+      "keywords": "去广告 屏蔽 广告 解析 防污染"
+    },
+    {
+      "id": "网络",
+      "order": 3,
+      "keywords": "路由 拨号 负载 限速 唤醒 校园网"
+    },
+    {
+      "id": "VPN 与穿透",
+      "order": 4,
+      "keywords": "内网穿透 远程 异地组网 回家 vpn"
+    },
+    {
+      "id": "服务",
+      "order": 5,
+      "keywords": ""
+    },
+    {
+      "id": "存储",
+      "order": 6,
+      "keywords": "网盘 共享 文件 硬盘 nas ftp"
+    },
+    {
+      "id": "下载",
+      "order": 7,
+      "keywords": "下载 磁力 bt 种子"
+    },
+    {
+      "id": "容器",
+      "order": 8,
+      "keywords": "虚拟化 docker 容器"
+    },
+    {
+      "id": "监控",
+      "order": 9,
+      "keywords": "监控 流量 统计 状态 温度"
+    },
+    {
+      "id": "多媒体",
+      "order": 10,
+      "keywords": "音乐 影音 投屏"
+    },
+    {
+      "id": "系统",
+      "order": 11,
+      "keywords": "重启 终端 权限 定时 屏幕"
+    },
+    {
+      "id": "协议",
+      "order": 12,
+      "keywords": "接口 协议 拨号 隧道"
+    },
+    {
+      "id": "主题",
+      "order": 13,
+      "keywords": "主题 界面 皮肤 外观"
+    },
+    {
+      "id": "其它",
+      "order": 14,
+      "keywords": ""
+    }
+  ],
+  "menu_category_map": {
+    "services": "服务",
+    "network": "网络",
+    "vpn": "VPN 与穿透",
+    "nas": "存储",
+    "system": "系统",
+    "status": "监控",
+    "docker": "容器",
+    "modem": "网络"
+  },
+  "category_rules": [
+    {
+      "cat": "代理",
+      "match": [
+        "passwall",
+        "openclash",
+        "homeproxy",
+        "shadowsocks",
+        "v2ray",
+        "xray",
+        "sing-box",
+        "mihomo",
+        "nikki",
+        "ssr",
+        "trojan",
+        "hysteria",
+        "tuic",
+        "clash",
+        "privoxy"
+      ]
+    },
+    {
+      "cat": "DNS 与广告",
+      "match": [
+        "adblock",
+        "adguard",
+        "smartdns",
+        "unbound",
+        "dnsmasq",
+        "dnsfilter",
+        "https-dns",
+        "bind",
+        "banip",
+        "dnscrypt",
+        "ddns"
+      ]
+    },
+    {
+      "cat": "下载",
+      "match": [
+        "aria2",
+        "qbittorrent",
+        "transmission",
+        "amule",
+        "deluge",
+        "rtorrent"
+      ]
+    },
+    {
+      "cat": "存储",
+      "match": [
+        "nfs",
+        "rclone",
+        "syncthing",
+        "vsftpd",
+        "diskman",
+        "samba",
+        "ksmbd",
+        "minidlna",
+        "hd-idle",
+        "ps3netsrv",
+        "usb-printer",
+        "openlist",
+        "alist",
+        "nas",
+        "ftp",
+        "mjpg"
+      ]
+    },
+    {
+      "cat": "容器",
+      "match": [
+        "docker",
+        "lxc"
+      ]
+    },
+    {
+      "cat": "VPN 与穿透",
+      "match": [
+        "openvpn",
+        "ocserv",
+        "softethervpn",
+        "n2n",
+        "zerotier",
+        "tailscale",
+        "ipsec",
+        "strongswan",
+        "pptp",
+        "l2tp",
+        "nps",
+        "ngrok",
+        "frp",
+        "wireguard",
+        "headscale",
+        "openconnect"
+      ]
+    },
+    {
+      "cat": "监控",
+      "match": [
+        "statistics",
+        "nlbwmon",
+        "vnstat",
+        "wrtbwmon",
+        "netdata",
+        "status",
+        "cshark",
+        "cpulimit"
+      ]
+    },
+    {
+      "cat": "多媒体",
+      "match": [
+        "music-remote",
+        "airplay",
+        "oscam",
+        "unblockneteasemusic",
+        "upnp",
+        "dlna"
+      ]
+    },
+    {
+      "cat": "系统",
+      "match": [
+        "oled",
+        "k3screenctrl",
+        "ledtrig",
+        "splash",
+        "ltqtapi",
+        "example",
+        "autoreboot",
+        "acl",
+        "ttyd",
+        "statistics",
+        "watchcat",
+        "commands",
+        "opkg",
+        "attendedsysupgrade",
+        "firewall",
+        "package-manager",
+        "uhttpd",
+        "ubifs",
+        "ramfree",
+        "filemanager"
+      ]
+    },
+    {
+      "cat": "网络",
+      "match": [
+        "pppoe",
+        "timewol",
+        "nft-qos",
+        "appfilter",
+        "cd8021x",
+        "njitclient",
+        "scutclient",
+        "syncdial",
+        "xlnetacc",
+        "haproxy",
+        "bmx7",
+        "olsr",
+        "crowdsec",
+        "sms-tool",
+        "mwan3",
+        "sqm",
+        "qos",
+        "wol",
+        "multiwan",
+        "vlmcsd",
+        "upnp",
+        "banip",
+        "dawn",
+        "wifischedule",
+        "e2guardian",
+        "3ginfo",
+        "modem"
+      ]
+    }
+  ],
+  "sources": [
+    {
+      "id": "immortalwrt-24.10",
+      "name": "ImmortalWrt",
+      "repo_url": "https://github.com/immortalwrt/immortalwrt",
+      "branch": "openwrt-24.10"
+    },
+    {
+      "id": "immortalwrt-23.05",
+      "name": "ImmortalWrt",
+      "repo_url": "https://github.com/immortalwrt/immortalwrt",
+      "branch": "openwrt-23.05"
+    },
+    {
+      "id": "immortalwrt-master",
+      "name": "ImmortalWrt",
+      "repo_url": "https://github.com/immortalwrt/immortalwrt",
+      "branch": "master"
+    },
+    {
+      "id": "openwrt-24.10",
+      "name": "OpenWrt 官方",
+      "repo_url": "https://github.com/openwrt/openwrt",
+      "branch": "openwrt-24.10"
+    },
+    {
+      "id": "lede-master",
+      "name": "LEDE",
+      "repo_url": "https://github.com/coolsnowwolf/lede",
+      "branch": "master"
+    }
+  ],
+  "overrides": {
+    "luci-app-passwall": {
+      "desc": "多节点、分流规则完整的代理工具。",
+      "tut": "装好后先添加订阅，再选择分流模式。",
+      "size_mb": 1.8,
+      "rec": false
+    },
+    "luci-app-openclash": {
+      "desc": "兼容 Clash 配置的代理客户端，内核体积较大。",
+      "tut": "上传配置文件或订阅地址，并下载内核。",
+      "size_mb": 9,
+      "rec": false
+    },
+    "luci-app-homeproxy": {
+      "desc": "基于 sing-box 的轻量代理，界面简洁。",
+      "tut": "在「服务 → HomeProxy」导入节点即可。",
+      "size_mb": 3.5,
+      "rec": false
+    },
+    "luci-app-smartdns": {
+      "desc": "多上游并发解析，选最快的结果。",
+      "tut": "勾选「重定向 53 端口」即可生效。",
+      "size_mb": 1.2,
+      "rec": false
+    },
+    "luci-app-ddns-go": {
+      "desc": "自动把公网 IP 解析到你的域名。",
+      "tut": "打开 9876 端口，填写服务商密钥。",
+      "size_mb": 3,
+      "rec": false
+    },
+    "luci-app-mwan3": {
+      "desc": "多条宽带叠加或互为备份。",
+      "tut": "先添加接口，再设置成员和策略。",
+      "size_mb": 0.2,
+      "rec": false
+    },
+    "luci-proto-wireguard": {
+      "desc": "在外也能安全回家访问内网。",
+      "tut": "「网络 → 接口」新增 WireGuard 协议。",
+      "size_mb": 0.1,
+      "rec": false
+    },
+    "luci-app-upnp": {
+      "desc": "让下载、游戏程序自动开放端口。",
+      "tut": "勾选启用即可，注意安全风险。",
+      "size_mb": 0.1,
+      "rec": false
+    },
+    "luci-app-openlist": {
+      "desc": "把多个网盘聚合成统一的文件目录。",
+      "tut": "首次启动后在日志里查看管理员密码。",
+      "size_mb": 12,
+      "rec": false
+    },
+    "luci-app-samba4": {
+      "desc": "局域网内共享硬盘文件夹。",
+      "tut": "先挂载硬盘，再添加共享目录。",
+      "size_mb": 2.5,
+      "rec": false
+    },
+    "luci-app-qbittorrent": {
+      "desc": "功能完整的 BT 下载客户端。",
+      "tut": "默认端口 8080，请修改初始密码。",
+      "size_mb": 6,
+      "rec": false
+    },
+    "luci-app-aria2": {
+      "desc": "轻量多线程下载，可配合网页界面。",
+      "tut": "设置下载目录后即可使用。",
+      "size_mb": 1.5,
+      "rec": false
+    },
+    "luci-app-ttyd": {
+      "desc": "在浏览器里直接打开路由器命令行。",
+      "tut": "进入「系统 → 终端」。",
+      "size_mb": 0.3,
+      "rec": false
+    },
+    "luci-app-netdata": {
+      "desc": "实时查看 CPU、流量、温度曲线。",
+      "tut": "打开 19999 端口查看仪表盘。",
+      "size_mb": 5,
+      "rec": false
+    },
+    "luci-app-unblockneteasemusic": {
+      "desc": "解除网易云音乐的播放限制。",
+      "tut": "启用后按说明设置设备代理。",
+      "size_mb": 2.8,
+      "rec": false
+    },
+    "luci-app-dockerman": {
+      "desc": "运行容器，体积和内存占用都较大。",
+      "tut": "需要外接存储，空间小的设备不建议。",
+      "size_mb": 30,
+      "rec": false
+    },
+    "luci-app-autoreboot": {
+      "desc": "按计划自动重启，保持稳定。",
+      "tut": "设置每天或每周的重启时间。",
+      "size_mb": 0.05,
+      "rec": false
+    },
+    "luci-theme-argon": {
+      "desc": "清爽的深浅色自适应界面。",
+      "tut": "在「系统 → 主题」切换。",
+      "size_mb": 0.6,
+      "rec": false
+    }
+  },
+  "extras": [
+    {
+      "id": "luci-app-store",
+      "name": "iStore 软件中心",
+      "desc": "固件只带基础功能，装机后在路由器里按需安装更多插件，大幅减小固件。",
+      "cat": "系统",
+      "kind": "app",
+      "origin": {
+        "type": "feed",
+        "name": "istore",
+        "line": "src-git istore https://github.com/linkease/istore;main"
+      },
+      "deps": [],
+      "requires": [
+        "luci-compat"
+      ],
+      "size_mb": 0.6,
+      "rec": true,
+      "tut": "进入「系统 → 软件中心」，每个应用都附带教程。",
+      "tags": []
+    },
+    {
+      "id": "luci-app-socat",
+      "name": "Socat 端口转发",
+      "desc": "功能较全的 TCP/UDP 转发工具（作者自维护仓库）。",
+      "cat": "网络",
+      "kind": "app",
+      "origin": {
+        "type": "git",
+        "name": "luci-app-socat",
+        "url": "https://github.com/mylucien/luci-app-socat",
+        "branch": "",
+        "sparse": false,
+        "dirs": []
+      },
+      "deps": [
+        "socat"
+      ],
+      "requires": [],
+      "size_mb": 0.1,
+      "rec": false,
+      "tut": "在「网络 → Socat」添加规则。",
+      "tags": []
+    }
+  ]
+}

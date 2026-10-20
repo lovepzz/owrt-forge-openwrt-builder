@@ -4,9 +4,12 @@ on:
   repository_dispatch:
     types: [build-openwrt]
 
+concurrency:
+  group: build-openwrt
+  cancel-in-progress: false
+
 env:
   WORKER_URL: "${{ github.event.client_payload.worker_url }}"
-  REPORT_TOKEN: "${{ secrets.REPORT_TOKEN }}"
   SCRIPTS_DIR: "${{ github.workspace }}/scripts"
 
 jobs:
@@ -16,48 +19,51 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Setup SSH
+      - uses: actions/checkout@v4
+
+      - name: 配置 SSH（仅私有插件仓库需要，可不设置 SSH_PRIVATE_KEY）
+        env:
+          SSH_KEY: "${{ secrets.SSH_PRIVATE_KEY }}"
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
+          if [ -n "$SSH_KEY" ]; then printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519; chmod 600 ~/.ssh/id_ed25519; fi
           ssh-keyscan github.com >> ~/.ssh/known_hosts
 
-      - name: 检出仓库（获取 .github/scripts）
-        uses: actions/checkout@v4
-        
       - name: 拉取完整配置
         id: config
         env:
           BUILD_ID: "${{ github.event.client_payload.build_id }}"
+          REPORT_TOKEN: "${{ secrets.REPORT_TOKEN }}"
         run: bash "$SCRIPTS_DIR/fetch-config.sh"
 
       - name: 上报：已开始
-        run: |
-          bash "$SCRIPTS_DIR/report.sh" "${{ steps.config.outputs.build_id }}" running \
-            "\"github_run_id\":\"${{ github.run_id }}\""
+        env:
+          BUILD_ID: "${{ steps.config.outputs.build_id }}"
+          RUN_ID: "${{ github.run_id }}"
+          REPORT_TOKEN: "${{ secrets.REPORT_TOKEN }}"
+        run: bash "$SCRIPTS_DIR/report.sh" "$BUILD_ID" running "github_run_id=$RUN_ID"
 
-      - name: 安装基础依赖
+      - name: 释放磁盘并安装依赖
         run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
           sudo apt-get update -q
-          sudo apt-get install -y jq curl
+          sudo apt-get install -y build-essential clang flex bison g++ gawk gettext git libncurses-dev libssl-dev python3-setuptools rsync swig unzip zlib1g-dev file wget jq curl
+          df -h /
 
       - name: 克隆主源码
         run: |
           set -e
-          git clone --depth 1 -b "$(jq -r .branch config.json)" \
-            "$(jq -r .repo_url config.json)" openwrt
+          git clone --depth 1 -b "$(jq -r .branch config.json)" "$(jq -r .repo_url config.json)" openwrt
 
       - name: 自定义脚本①（feeds update 之前）
         run: |
           jq -r .diy_script_1 config.json > diy1.sh
-          chmod +x diy1.sh
           cd openwrt && bash ../diy1.sh
 
       - name: feeds update
         run: cd openwrt && ./scripts/feeds update -a
 
-      - name: 克隆插件源码（支持整仓 / 稀疏克隆）
+      - name: 克隆插件源码（整仓 / 稀疏）
         run: bash "$SCRIPTS_DIR/clone-plugins.sh"
 
       - name: feeds install
@@ -66,51 +72,60 @@ jobs:
       - name: 自定义脚本②（feeds install 之后）
         run: |
           jq -r .diy_script_2 config.json > diy2.sh
-          chmod +x diy2.sh
           cd openwrt && bash ../diy2.sh
 
-      - name: 写入底稿 .config（如有）
+      - name: 清理凭据（之后的 make 会执行第三方插件代码）
+        run: rm -f ~/.ssh/id_ed25519
+
+      - name: 生成配置（设备 + 插件清单 / 底稿）
         env:
           HAS_DOTCONFIG: "${{ steps.config.outputs.has_dotconfig }}"
         run: bash "$SCRIPTS_DIR/write-dotconfig.sh"
 
-      # ── 手动触发：ttyd menuconfig ────────────────────────────────
+      # ── 可选：menuconfig 网页终端 ──
       - name: 启动 ttyd Web 终端
-        if: steps.config.outputs.trigger_type == 'manual'
+        if: steps.config.outputs.menuconfig == 'true'
         id: webterm
         env:
           TTYD_USER: "${{ secrets.TTYD_USER }}"
           TTYD_PASS: "${{ secrets.TTYD_PASS }}"
           BUILD_ID: "${{ steps.config.outputs.build_id }}"
+          REPORT_TOKEN: "${{ secrets.REPORT_TOKEN }}"
           OPENWRT_DIR: "${{ github.workspace }}/openwrt"
         run: bash "$SCRIPTS_DIR/webterm-start.sh"
 
       - name: 上报：Web 终端地址
-        if: steps.config.outputs.trigger_type == 'manual'
-        run: |
-          bash "$SCRIPTS_DIR/report.sh" "${{ steps.config.outputs.build_id }}" menuconfig \
-            "\"web_url\":\"${{ steps.webterm.outputs.web_url }}\""
-
-      - name: 等待 menuconfig 完成（超时 30 分钟）
-        if: steps.config.outputs.trigger_type == 'manual'
+        if: steps.config.outputs.menuconfig == 'true'
         env:
           BUILD_ID: "${{ steps.config.outputs.build_id }}"
+          WEB_URL: "${{ steps.webterm.outputs.web_url }}"
+          REPORT_TOKEN: "${{ secrets.REPORT_TOKEN }}"
+        run: bash "$SCRIPTS_DIR/report.sh" "$BUILD_ID" menuconfig "web_url=$WEB_URL"
+
+      - name: 等待 menuconfig 完成（超时 30 分钟）
+        if: steps.config.outputs.menuconfig == 'true'
+        env:
+          BUILD_ID: "${{ steps.config.outputs.build_id }}"
+          REPORT_TOKEN: "${{ secrets.REPORT_TOKEN }}"
         run: bash "$SCRIPTS_DIR/wait-menuconfig.sh"
-      # ── ttyd 结束 ────────────────────────────────────────────────
 
       - name: 上报：开始编译
-        run: bash "$SCRIPTS_DIR/report.sh" "${{ steps.config.outputs.build_id }}" compiling
+        env:
+          BUILD_ID: "${{ steps.config.outputs.build_id }}"
+          REPORT_TOKEN: "${{ secrets.REPORT_TOKEN }}"
+        run: bash "$SCRIPTS_DIR/report.sh" "$BUILD_ID" compiling
 
       - name: 编译
         run: |
           cd openwrt
-          make -j$(nproc) || make -j1 V=s
+          set -o pipefail
+          env -u REPORT_TOKEN -u WORKER_URL make download -j8 2>&1 | tee /tmp/make.log
+          (env -u REPORT_TOKEN -u WORKER_URL make -j"$(nproc)" || env -u REPORT_TOKEN -u WORKER_URL make -j1 V=s) 2>&1 | tee -a /tmp/make.log
 
       - name: 打包产物
         run: bash "$SCRIPTS_DIR/package-artifacts.sh"
 
       - name: 发布 Release
-        id: release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: "build-${{ steps.config.outputs.build_id }}"
@@ -120,9 +135,16 @@ jobs:
             openwrt/bin/targets/**/*factory*
             *-packages.tar.gz
 
+      - name: 清理旧 Release（保留最近 10 个）
+        if: success()
+        env:
+          GH_TOKEN: "${{ github.token }}"
+        run: gh release list --limit 100 --json tagName --jq '.[10:][].tagName' | xargs -r -I{} gh release delete {} --cleanup-tag --yes
+
       - name: 上报：完成
         if: always()
         env:
           BUILD_ID: "${{ steps.config.outputs.build_id }}"
           JOB_STATUS: "${{ job.status }}"
+          REPORT_TOKEN: "${{ secrets.REPORT_TOKEN }}"
         run: bash "$SCRIPTS_DIR/report-final.sh"

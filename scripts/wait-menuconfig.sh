@@ -17,7 +17,7 @@ while [ ! -f /tmp/menuconfig-done ]; do
   sleep 10
   ELAPSED=$((ELAPSED + 10))
   if [ "$ELAPSED" -ge "$TIMEOUT" ]; then
-    bash "$SCRIPTS_DIR/report.sh" "$BUILD_ID" failed '"reason":"menuconfig_timeout"'
+    bash "$SCRIPTS_DIR/report.sh" "$BUILD_ID" failed "reason=menuconfig_timeout"
     exit 1
   fi
 done
