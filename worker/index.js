@@ -1,28 +1,4 @@
 // ============================================================
-// OpenWrt 自动编译系统 — Cloudflare Worker
-// 单文件部署版本：直接粘贴到 Cloudflare Worker 在线编辑器即可
-//
-// 部署前需要：
-// 1. 创建 D1 数据库，执行下方 system_config 建表 SQL（以及原有 templates /
-//    builds / dotconfig_history 表，见设计文档）
-// 2. 在 Worker 设置中绑定 D1 数据库，变量名必须为 DB
-// 3. 配置唯一一个 Secret：
-//    MASTER_KEY — 任意长随机字符串，用于加密 D1 中的敏感配置，并派生 session 签名密钥。
-//    登录密码、GitHub 仓库/Token、Worker URL、REPORT_TOKEN 等全部通过网页"系统初始化"
-//    与"部署向导"在线填写并加密存入 D1，不再需要在 Cloudflare 里逐项配置 Secret/变量。
-// 4. 如需定时编译，在 wrangler.toml 或 Worker 设置中配置 Cron Triggers
-//
-// system_config 建表 SQL：
-//   CREATE TABLE IF NOT EXISTS system_config (
-//     key   TEXT PRIMARY KEY,
-//     value TEXT NOT NULL
-//   );
-//
-// 取消编译功能需要 builds 表新增一列（已有部署执行一次即可，新部署建表时直接加上）：
-//   ALTER TABLE builds ADD COLUMN github_run_id TEXT;
-// ============================================================
-
-// ============================================================
 // 基础工具函数
 // ============================================================
 function json(data, status = 200, extraHeaders = {}) {
