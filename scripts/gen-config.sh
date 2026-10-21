@@ -136,9 +136,15 @@ diagnose() {
     make defconfig > /dev/null 2>&1 || true
     still=""
     for p in $(cat /tmp/missing-packages); do grep -q "^CONFIG_PACKAGE_${p}=y" .config || still="$still $p"; done
+    if [ -z "$still" ] && [ -n "$P" ] && [ "$(echo $gates | wc -w)" -le 6 ]; then
+      # 这些包是 Kconfig 条件明确要求的（depends on PACKAGE_xxx），补上后全部生效：保留这份配置，不再失败
+      AUTO_ADDED="${gates% }"
+      : > /tmp/missing-packages
+      return 0
+    fi
     cp /tmp/config.before-gate .config
-    if [ -z "$still" ]; then echo "- 已验证：在模板里额外加上这些包，缺失的插件就都能生效：${gates}（自定义插件的「额外需要的包」里填上，或在商店里一并勾选）"
-    else echo "- 额外启用 ${gates} 后，仍有没生效的：${still}"; fi
+    if [ -z "$still" ]; then echo "- 已验证：额外启用 ${gates}后，缺失的插件都能生效（未选择机型，没有自动补上；请在模板里加上这些包）"
+    else echo "- 额外启用 ${gates}后，仍有没生效的：${still}"; fi
   fi
   if grep -q "unmet direct dependencies" /tmp/defconfig.log 2>/dev/null; then
     echo "- defconfig 输出里的「依赖未满足」警告（最多 30 行）："
@@ -152,12 +158,25 @@ diagnose() {
 }
 
 if [ -s /tmp/missing-packages ]; then
-  { echo "有插件没生效："; diagnose; } > /tmp/config-error
-  echo "::error::以下插件 defconfig 后没有生效：$(tr '\n' ' ' < /tmp/missing-packages)"
-  cat /tmp/config-error
-  if [ -n "$P" ]; then
-    exit 1      # 机型已确定，缺了插件就是真的缺：直接失败，省掉几小时无效编译
+  before="$(tr '\n' ' ' < /tmp/missing-packages)"
+  AUTO_ADDED=""
+  diagnose > /tmp/diag.txt
+  if [ -s /tmp/missing-packages ]; then
+    { echo "有插件没生效："; cat /tmp/diag.txt; } > /tmp/config-error
+    echo "::error::以下插件 defconfig 后没有生效：$(tr '\n' ' ' < /tmp/missing-packages)"
+    cat /tmp/config-error
+    if [ -n "$P" ]; then
+      exit 1      # 机型已确定，缺了插件就是真的缺：直接失败，省掉几小时无效编译
+    fi
+    echo "::warning::未选择机型，按警告处理，继续进入 menuconfig"
+  else
+    {
+      echo "已自动补上：${AUTO_ADDED}"
+      echo "原因：${before}的 Kconfig 条件要求这些包同时启用，否则会被整体丢掉；补上后已验证全部生效。"
+      echo "想把它固化进模板：在自定义插件的「额外需要的包」里填上这些包名。"
+    } > /tmp/config-error
+    echo "::notice::$(head -n1 /tmp/config-error)"
+    cat /tmp/config-error
   fi
-  echo "::warning::未选择机型，按警告处理，继续进入 menuconfig"
 fi
 exit 0
