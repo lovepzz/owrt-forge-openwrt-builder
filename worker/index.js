@@ -1507,7 +1507,25 @@ function json(data, status = 200, extraHeaders = {}) {
   function cleanRepoUrl(u) { return String(u || '').trim().replace(/\/+$/, '').replace(/\.git$/, ''); }
   function httpsRepoOk(u) { return u.length <= 300 && /^https:\/\/[A-Za-z0-9.-]+(:\d+)?\/[A-Za-z0-9._~\/%+@-]+$/.test(u); }
 
-  // 自动识别：根目录有 Makefile → 整个仓库就是一个包；否则列出 3 层以内带 Makefile 的子目录，让用户勾选
+  // 从 Makefile 文本里取出它定义的包名：BuildPackage 的字面量、PKG_NAME；都没有（luci 应用）就用目录名。
+  // 包名以 Makefile 为准，不是目录名：CONFIG_PACKAGE_<包名> 才是 .config 里要启用的符号。
+  function makefilePkgNames(text, dirBase) {
+    const names = [], t = text || '';
+    const add = (n) => { if (n && PKG_RE.test(n) && !names.includes(n)) names.push(n); };
+    const pkg = cleanVal(mkVar(t, 'PKG_NAME'));
+    for (const m of t.matchAll(/call\s+BuildPackage,\s*([A-Za-z0-9_.+-]+)/g)) add(m[1]);
+    if (/call\s+BuildPackage,\s*\$\(PKG_NAME\)/.test(t)) add(pkg);
+    if (!names.length) add(pkg);
+    if (!names.length) add(dirBase);
+    return names;
+  }
+  function pickPrimary(names, dirBase) {
+    const id = names.includes(dirBase) ? dirBase : names[0];
+    return { id, requires: names.filter((n) => n !== id) };
+  }
+
+  // 自动识别：根目录有 Makefile → 整个仓库就是一个包；否则列出 3 层以内带 Makefile 的子目录，让用户勾选。
+  // 包名都读自 Makefile（一个目录里定义了多个包时，其余的作为自动依赖一起启用）
   async function handleDetectCustomPlugin(request, env) {
     const body = await request.json().catch(() => null);
     if (!body) return err('请求格式错误');
@@ -1523,14 +1541,17 @@ function json(data, status = 200, extraHeaders = {}) {
       const tree = await ghJson(env, `/repos/${gh.owner}/${gh.repo}/git/trees/${encodeURIComponent(branch)}?recursive=1`);
       const dirs = (tree.tree || []).filter((e) => e.type === 'blob' && /(^|\/)Makefile$/.test(e.path)).map((e) => e.path.replace(/\/?Makefile$/, ''));
       const root = dirs.includes('');
-      let pkg = gh.repo;
-      if (root) {
-        const v = cleanVal(mkVar(await rawText(gh, branch, 'Makefile'), 'PKG_NAME'));
-        if (v && PKG_RE.test(v)) pkg = v;
-      }
-      const candidates = dirs.filter((p) => p && p.split('/').length <= 3 && GIT_DIR_RE.test(p)).slice(0, 300)
-        .map((p) => ({ path: p, id: p.split('/').pop() })).filter((c) => PKG_RE.test(c.id));
-      return json({ detected: true, branch, repo: gh.repo, root, pkg_name: PKG_RE.test(pkg) ? pkg : gh.repo, candidates, truncated: !!tree.truncated });
+      let primary = { id: PKG_RE.test(gh.repo) ? gh.repo : 'plugin', requires: [] };
+      if (root) primary = pickPrimary(makefilePkgNames(await rawText(gh, branch, 'Makefile'), primary.id), primary.id);
+      let candidates = dirs.filter((p) => p && p.split('/').length <= 3 && GIT_DIR_RE.test(p)).slice(0, 300)
+        .map((p) => ({ path: p, base: p.split('/').pop() })).filter((c) => PKG_RE.test(c.base));
+      // 读取前 30 个目录的 Makefile 得到真实包名（并行；加上前面 2~3 次请求，仍在 Worker 50 个子请求的限制内）
+      const texts = root ? [] : await Promise.all(candidates.slice(0, 30).map((c) => rawText(gh, branch, c.path + '/Makefile').catch(() => '')));
+      candidates = candidates.map((c, i) => {
+        const pk = pickPrimary(makefilePkgNames(texts[i], c.base), c.base);
+        return { path: c.path, id: pk.id, requires: pk.requires };
+      });
+      return json({ detected: true, branch, repo: gh.repo, root, pkg_name: primary.id, requires: primary.requires, candidates, truncated: !!tree.truncated });
     } catch (e) { return err(e.message, 502); }
   }
 
@@ -1551,11 +1572,15 @@ function json(data, status = 200, extraHeaders = {}) {
     const items = [];
     if (Array.isArray(body.dirs) && body.dirs.length) {
       if (body.dirs.length > 20) return err('一次最多添加 20 个子目录');
-      for (const d of body.dirs.map(String)) {
+      for (const raw of body.dirs) {
+        const d = String(typeof raw === 'string' ? raw : (raw && raw.path) || '');
         if (!GIT_DIR_RE.test(d) || d.length > 200) return err(`子目录非法：${d.slice(0, 60)}`);
-        const id = d.split('/').pop();
-        if (!PKG_RE.test(id)) return err(`子目录名非法：${id.slice(0, 60)}`);
-        items.push({ id, origin: { type: 'git', name: id, url: repo_url, branch, sparse: true, dirs: [d] } });
+        const base = d.split('/').pop();
+        if (!PKG_RE.test(base)) return err(`子目录名非法：${base.slice(0, 60)}`);
+        const id = (raw && typeof raw === 'object' && raw.id) ? String(raw.id) : base;   // 包名以 Makefile 为准，可以和目录名不同
+        if (!PKG_RE.test(id)) return err(`包名非法：${id.slice(0, 60)}`);
+        const own = (raw && typeof raw === 'object') ? sanitizeIds(raw.requires, 20) : [];
+        items.push({ id, own, origin: { type: 'git', name: base, url: repo_url, branch, sparse: true, dirs: [d] } });
       }
     } else {
       const id = String(body.id || '').trim();
@@ -1574,7 +1599,7 @@ function json(data, status = 200, extraHeaders = {}) {
         name: items.length === 1 && body.name ? String(body.name).trim().slice(0, 40) || it.id : it.id,
         desc: desc || `自定义插件，来自 ${repo_url.replace('https://', '')}`,
         desc_en: '', cat: '自定义', kind: 'app', origin: it.origin,
-        deps: [], requires, size_mb: null, rec: false, tut: '', tags: [], hidden: false, custom: true, created_at: now(),
+        deps: [], requires: Array.from(new Set(requires.concat(it.own || []))).filter((x) => x !== it.id), size_mb: null, rec: false, tut: '', tags: [], hidden: false, custom: true, created_at: now(),
       };
       if (dupIdx >= 0) list[dupIdx] = entry; else list.push(entry);
       added.push(entry);
@@ -3197,13 +3222,14 @@ function json(data, status = 200, extraHeaders = {}) {
         det = await api.post('/api/custom-plugins/detect', { repo_url: url, branch: br });
         if (!det.detected) { manualForm(det.reason); return; }
         if (det.root) {
-          manualForm('识别为单个插件包。');
+          manualForm('识别为单个插件包（包名读自仓库根目录的 Makefile，可以改）。');
           m.querySelector('#cp-id').value = det.pkg_name;
+          m.querySelector('#cp-req').value = (det.requires || []).join(', ');
         } else if (det.candidates.length) {
           res.innerHTML = '<div class="hint">这个仓库里有多个包，勾选要添加的（共 ' + det.candidates.length + ' 个' + (det.truncated ? '，仓库太大，列表可能不完整' : '') + '）：</div>'
             + '<input id="cp-filter" type="search" placeholder="筛选" style="width:100%;margin:6px 0">'
             + '<div id="cp-cands" style="max-height:220px;overflow:auto;border:1px solid var(--border);border-radius:8px;padding:4px 8px">'
-            + det.candidates.map(function (c) { return '<label class="cp-cand" style="display:flex;gap:8px;padding:3px 0;font-size:13px"><input type="checkbox" data-path="' + escapeHtml(c.path) + '" style="width:auto"><span>' + escapeHtml(c.path) + '</span></label>'; }).join('') + '</div>'
+            + det.candidates.map(function (c) { const base = c.path.split('/').pop(); return '<label class="cp-cand" style="display:flex;gap:8px;padding:3px 0;font-size:13px"><input type="checkbox" data-path="' + escapeHtml(c.path) + '" style="width:auto"><span>' + escapeHtml(c.path) + (c.id !== base ? ' <b>→ 包名 ' + escapeHtml(c.id) + '</b>' : '') + ((c.requires || []).length ? ' <small>（同时包含 ' + escapeHtml(c.requires.join(', ')) + '）</small>' : '') + '</span></label>'; }).join('') + '</div>'
             + '<div style="text-align:right;margin-top:10px"><button class="primary" id="cp-add-dirs">添加所选</button></div>';
           m.querySelector('#cp-filter').oninput = function (e) {
             const q = e.target.value.trim().toLowerCase();
@@ -3222,7 +3248,7 @@ function json(data, status = 200, extraHeaders = {}) {
           const body = { repo_url: url, branch: br, id: m.querySelector('#cp-id').value.trim(), name: m.querySelector('#cp-name').value.trim(), desc: m.querySelector('#cp-desc').value.trim(), requires: m.querySelector('#cp-req').value.split(',').map(function (x) { return x.trim(); }).filter(Boolean) };
           await after(await api.post('/api/custom-plugins', body));
         } else if (b.id === 'cp-add-dirs') {
-          const dirs = Array.prototype.map.call(m.querySelectorAll('#cp-cands input:checked'), function (x) { return x.dataset.path; });
+          const dirs = Array.prototype.map.call(m.querySelectorAll('#cp-cands input:checked'), function (x) { const c = det.candidates.find(function (y) { return y.path === x.dataset.path; }); return { path: x.dataset.path, id: c ? c.id : '', requires: c ? c.requires : [] }; });
           if (!dirs.length) { toast('请先勾选要添加的包', 'error'); return; }
           await after(await api.post('/api/custom-plugins', { repo_url: url, branch: br, dirs: dirs }));
         } else if (b.dataset && b.dataset.cpdel) {

@@ -5,6 +5,16 @@ ROOT="$PWD"; mkdir -p openwrt/package
 NAME_RE='^[A-Za-z0-9_.+-]+$'
 URL_RE='^(https://[A-Za-z0-9.-]+(:[0-9]+)?/[A-Za-z0-9._~/%+@-]+|git@[A-Za-z0-9.-]+:[A-Za-z0-9._~/+-]+)$'
 DIR_RE='^[A-Za-z0-9._+/-]+$'
+# 很多 luci 应用的 Makefile 写的是 `include ../../luci.mk`（相对 luci feed 的位置），放进 package/ 后找不到，
+# 整个包会被 OpenWrt 扫描时悄悄丢掉。统一改成不依赖位置的写法。
+fix_luci_include() {
+  find "$1" -name Makefile -print0 2>/dev/null | while IFS= read -r -d '' f; do
+    if grep -qE 'include[[:space:]]+(\.\./)+luci\.mk' "$f"; then
+      sed -i -E 's#include[[:space:]]+(\.\./)+luci\.mk#include $(TOPDIR)/feeds/luci/luci.mk#' "$f"
+      echo "已修正 luci.mk 相对路径：${f#"$ROOT"/openwrt/}"
+    fi
+  done
+}
 jq -c '.plugins[]?' config.json | while read -r p; do
   name=$(jq -r .name <<<"$p")
   [[ "$name" =~ $NAME_RE ]] || { echo "::error::插件目录名非法: $name"; exit 1; }
@@ -27,10 +37,11 @@ jq -c '.plugins[]?' config.json | while read -r p; do
     git clone --depth=1 "${bopt[@]}" --single-branch --filter=blob:none --sparse -- "$url" "$tmp/r"
     git -C "$tmp/r" sparse-checkout set "${dirs[@]}"
     # 同名的源码自带包会被这里的版本替换（直接 mv 到已存在的目录里会变成嵌套目录）
-    for d in "${dirs[@]}"; do rm -rf "$ROOT/openwrt/package/$(basename "$d")"; mv -f "$tmp/r/$d" "$ROOT/openwrt/package/$(basename "$d")"; done
+    for d in "${dirs[@]}"; do rm -rf "$ROOT/openwrt/package/$(basename "$d")"; mv -f "$tmp/r/$d" "$ROOT/openwrt/package/$(basename "$d")"; fix_luci_include "$ROOT/openwrt/package/$(basename "$d")"; done
     rm -rf "$tmp"
   else
     rm -rf "$ROOT/openwrt/package/$name"
     git clone --depth 1 "${bopt[@]}" -- "$url" "$ROOT/openwrt/package/$name"
+    fix_luci_include "$ROOT/openwrt/package/$name"
   fi
 done
