@@ -1,4 +1,28 @@
 // ============================================================
+// OpenWrt 自动编译系统 — Cloudflare Worker
+// 单文件部署版本：直接粘贴到 Cloudflare Worker 在线编辑器即可
+//
+// 部署前需要：
+// 1. 创建 D1 数据库，执行下方 system_config 建表 SQL（以及原有 templates /
+//    builds / dotconfig_history 表，见设计文档）
+// 2. 在 Worker 设置中绑定 D1 数据库，变量名必须为 DB
+// 3. 配置唯一一个 Secret：
+//    MASTER_KEY — 任意长随机字符串，用于加密 D1 中的敏感配置，并派生 session 签名密钥。
+//    登录密码、GitHub 仓库/Token、Worker URL、REPORT_TOKEN 等全部通过网页"系统初始化"
+//    与"部署向导"在线填写并加密存入 D1，不再需要在 Cloudflare 里逐项配置 Secret/变量。
+// 4. 如需定时编译，在 wrangler.toml 或 Worker 设置中配置 Cron Triggers
+//
+// system_config 建表 SQL：
+//   CREATE TABLE IF NOT EXISTS system_config (
+//     key   TEXT PRIMARY KEY,
+//     value TEXT NOT NULL
+//   );
+//
+// 取消编译功能需要 builds 表新增一列（已有部署执行一次即可，新部署建表时直接加上）：
+//   ALTER TABLE builds ADD COLUMN github_run_id TEXT;
+// ============================================================
+
+// ============================================================
 // 基础工具函数
 // ============================================================
 function json(data, status = 200, extraHeaders = {}) {
@@ -3183,14 +3207,15 @@ function json(data, status = 200, extraHeaders = {}) {
         return '<div style="display:flex;gap:8px;align-items:center;padding:6px 0;border-bottom:1px solid var(--border)"><div style="flex:1;min-width:0"><b>' + escapeHtml(p.name) + '</b> <code class="hint">' + escapeHtml(p.id) + '</code><div class="hint" style="word-break:break-all">' + escapeHtml((o.url || '') + (o.sparse && o.dirs ? ' · ' + o.dirs.join(', ') : '')) + '</div></div><button class="ghost small" data-cpdel="' + escapeHtml(p.id) + '">删除</button></div>';
       }).join('') : '<div class="hint">还没有自定义插件</div>';
     }
-    const m = el('<div class="modal-backdrop" style="position:fixed;inset:0;background:rgba(0,0,0,.45);display:grid;place-items:center;z-index:50;padding:16px"><div style="background:var(--panel);border-radius:14px;padding:20px;width:min(560px,94vw);max-height:90vh;overflow:auto"><h2 style="margin:0 0 4px">添加自定义插件</h2>'
+    const m = el('<div class="modal-backdrop" style="position:fixed;inset:0;background:rgba(0,0,0,.45);display:grid;place-items:center;z-index:50;padding:16px"><div style="background:var(--panel);border-radius:14px;padding:20px;width:min(560px,94vw);max-height:90vh;overflow:auto"><h2 style="margin:0 0 4px">添加 / 管理自定义插件</h2>'
       + '<div class="hint">填写插件源码的 GitHub 仓库地址，识别后添加到商店，勾选即可使用。整个仓库是一个包，或仓库里有多个包，都可以。</div>'
       + '<div class="st-warn" style="margin-top:8px">编译时会运行这个仓库里的代码，请只添加你信任的仓库。</div>'
-      + '<label style="display:block;margin-top:12px">仓库地址<input id="cp-url" placeholder="https://github.com/用户/仓库" style="width:100%"></label>'
+      + '<h3 style="margin:14px 0 4px;font-size:14px">已添加的自定义插件（可删除）</h3><div id="cp-list">' + listHtml() + '</div>'
+      + '<h3 style="margin:16px 0 0;font-size:14px">添加新的</h3>'
+      + '<label style="display:block;margin-top:8px">仓库地址<input id="cp-url" placeholder="https://github.com/用户/仓库" style="width:100%"></label>'
       + '<label style="display:block;margin-top:8px">分支（留空使用默认分支）<input id="cp-branch" style="width:100%"></label>'
       + '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px"><button class="primary" id="cp-detect">识别</button></div>'
       + '<div id="cp-res" style="margin-top:10px"></div>'
-      + '<h3 style="margin:16px 0 4px;font-size:14px">已添加的自定义插件</h3><div id="cp-list">' + listHtml() + '</div>'
       + '<div style="text-align:right;margin-top:14px"><button class="ghost" id="cp-close">关闭</button></div></div></div>');
     document.body.appendChild(m);
     const res = m.querySelector('#cp-res');
@@ -3200,7 +3225,7 @@ function json(data, status = 200, extraHeaders = {}) {
         + '<label style="display:block;margin-top:8px">包名（CONFIG_PACKAGE_ 后面的名字，如 luci-app-xxx）<input id="cp-id" style="width:100%"></label>'
         + '<label style="display:block;margin-top:8px">显示名称（可选）<input id="cp-name" style="width:100%"></label>'
         + '<label style="display:block;margin-top:8px">简介（可选）<input id="cp-desc" style="width:100%"></label>'
-        + '<label style="display:block;margin-top:8px">额外需要的包（可选，逗号分隔）<input id="cp-req" style="width:100%"></label>'
+        + '<label style="display:block;margin-top:8px">额外需要的包（可选，逗号分隔，例如 video-support）<input id="cp-req" style="width:100%"></label>'
         + '<div style="text-align:right;margin-top:10px"><button class="primary" id="cp-add-one">添加</button></div>';
     }
     async function after(r) {
@@ -3230,6 +3255,8 @@ function json(data, status = 200, extraHeaders = {}) {
             + '<input id="cp-filter" type="search" placeholder="筛选" style="width:100%;margin:6px 0">'
             + '<div id="cp-cands" style="max-height:220px;overflow:auto;border:1px solid var(--border);border-radius:8px;padding:4px 8px">'
             + det.candidates.map(function (c) { const base = c.path.split('/').pop(); return '<label class="cp-cand" style="display:flex;gap:8px;padding:3px 0;font-size:13px"><input type="checkbox" data-path="' + escapeHtml(c.path) + '" style="width:auto"><span>' + escapeHtml(c.path) + (c.id !== base ? ' <b>→ 包名 ' + escapeHtml(c.id) + '</b>' : '') + ((c.requires || []).length ? ' <small>（同时包含 ' + escapeHtml(c.requires.join(', ')) + '）</small>' : '') + '</span></label>'; }).join('') + '</div>'
+            + '<label style="display:block;margin-top:8px">所选插件都额外需要的包（可选，逗号分隔）<input id="cp-req-dirs" placeholder="例如 video-support" style="width:100%"></label>'
+            + '<div class="hint">有的源码对某些包有额外要求（比如依赖 ffmpeg 的包要先启用 video-support），否则编译前校验会提示该包没生效，并告诉你该填什么。</div>'
             + '<div style="text-align:right;margin-top:10px"><button class="primary" id="cp-add-dirs">添加所选</button></div>';
           m.querySelector('#cp-filter').oninput = function (e) {
             const q = e.target.value.trim().toLowerCase();
@@ -3250,7 +3277,8 @@ function json(data, status = 200, extraHeaders = {}) {
         } else if (b.id === 'cp-add-dirs') {
           const dirs = Array.prototype.map.call(m.querySelectorAll('#cp-cands input:checked'), function (x) { const c = det.candidates.find(function (y) { return y.path === x.dataset.path; }); return { path: x.dataset.path, id: c ? c.id : '', requires: c ? c.requires : [] }; });
           if (!dirs.length) { toast('请先勾选要添加的包', 'error'); return; }
-          await after(await api.post('/api/custom-plugins', { repo_url: url, branch: br, dirs: dirs }));
+          const rq = m.querySelector('#cp-req-dirs').value.split(',').map(function (x) { return x.trim(); }).filter(Boolean);
+          await after(await api.post('/api/custom-plugins', { repo_url: url, branch: br, dirs: dirs, requires: rq }));
         } else if (b.dataset && b.dataset.cpdel) {
           await api.del('/api/custom-plugins/' + encodeURIComponent(b.dataset.cpdel));
           STORE.sel.delete(b.dataset.cpdel);
@@ -3288,7 +3316,7 @@ function json(data, status = 200, extraHeaders = {}) {
       + '<div class="st-field"><label>机型<select id="st-dev"></select></label><input id="st-devq" type="search" autocomplete="off" placeholder="筛选机型，如 RAX3000M" style="margin-top:6px"><div class="hint" id="st-profhint"></div></div></div>'
       + '<div class="hint" id="st-devhint" style="margin:-8px 0 14px"></div>'
       + '<div class="st-layout"><div><div class="st-presets">一键方案：' + Object.keys(STORE_PRESETS).map(function (k) { return '<button class="ghost small" data-preset="' + k + '">' + k + '</button>'; }).join('') + '</div>'
-      + '<div class="st-tools"><input id="st-q" type="search" placeholder="搜索插件，如 广告、下载、代理" value="' + escapeHtml(STORE.q) + '"><button class="ghost" id="st-addcp">＋ 自定义插件</button></div>'
+      + '<div class="st-tools"><input id="st-q" type="search" placeholder="搜索插件，如 广告、下载、代理" value="' + escapeHtml(STORE.q) + '"><button class="ghost" id="st-addcp">＋ 添加 / 管理自定义插件</button></div>'
       + '<div class="st-chips" id="st-chips"></div><div class="st-grid" id="st-grid"></div><div style="text-align:center;margin:14px" id="st-more"></div></div><aside class="st-basket" id="st-basket"></aside></div>';
     storeDrawProjects();
     document.getElementById('st-src').onchange = function (e) {
@@ -3425,10 +3453,20 @@ function json(data, status = 200, extraHeaders = {}) {
   function storeDetail(id) {
     const p = storeBy(id); if (!p) return;
     const on = STORE.sel.has(id), o = storeOrigin(p);
-    const m = el('<div class="modal-backdrop" style="position:fixed;inset:0;background:rgba(0,0,0,.45);display:grid;place-items:center;z-index:50"><div style="background:var(--panel);border-radius:14px;padding:20px;width:min(460px,92vw)"><h2 style="margin:0">' + escapeHtml(p.name) + '</h2><code class="hint">' + p.id + '</code><p>' + escapeHtml(p.desc) + '</p>' + (p.tut ? '<p><b>使用提示：</b>' + escapeHtml(p.tut) + '</p>' : '') + '<p><b>依赖：</b>' + (p.deps.length ? escapeHtml(p.deps.join('、')) : '无') + '（由编译系统自动解决）</p>' + (o ? '<p><b>来源：</b>' + escapeHtml(o.git_url || o.feed) + '</p>' : '') + '<div style="display:flex;gap:8px;justify-content:flex-end"><button class="ghost" id="st-dx">关闭</button><button class="primary" id="st-da">' + (on ? '从固件移除' : '添加到固件') + '</button></div></div></div>');
+    const m = el('<div class="modal-backdrop" style="position:fixed;inset:0;background:rgba(0,0,0,.45);display:grid;place-items:center;z-index:50"><div style="background:var(--panel);border-radius:14px;padding:20px;width:min(460px,92vw)"><h2 style="margin:0">' + escapeHtml(p.name) + '</h2><code class="hint">' + p.id + '</code><p>' + escapeHtml(p.desc) + '</p>' + (p.tut ? '<p><b>使用提示：</b>' + escapeHtml(p.tut) + '</p>' : '') + '<p><b>依赖：</b>' + (p.deps.length ? escapeHtml(p.deps.join('、')) : '无') + '（由编译系统自动解决）</p>' + (o ? '<p><b>来源：</b>' + escapeHtml(o.git_url || o.feed) + '</p>' : '') + '<div style="display:flex;gap:8px;justify-content:flex-end">' + (p.custom && !p.stale ? '<button class="ghost" id="st-ddel" style="margin-right:auto">删除这个自定义插件</button>' : '') + '<button class="ghost" id="st-dx">关闭</button><button class="primary" id="st-da">' + (on ? '从固件移除' : '添加到固件') + '</button></div></div></div>');
     document.body.appendChild(m);
     m.querySelector('#st-dx').onclick = function () { m.remove(); };
     m.querySelector('#st-da').onclick = function () { storeToggle(id); m.remove(); };
+    const del = m.querySelector('#st-ddel');
+    if (del) del.onclick = async function () {
+      if (!confirm('删除自定义插件「' + p.name + '」？已保存的模板不受影响。')) return;
+      try {
+        await api.del('/api/custom-plugins/' + encodeURIComponent(id));
+        STORE.sel.delete(id); await storeReloadCatalog();
+        if (STORE.cat !== '全部' && STORE.cats.indexOf(STORE.cat) < 0) STORE.cat = '全部';
+        m.remove(); storeDrawGrid(); storeDrawBasket(); toast('已删除', 'success');
+      } catch (e) { reportApiError(e, '删除失败'); }
+    };
   }
 
   // 把所选插件的来源合并：同一个 feed 只写一次，同一个仓库的多个子目录合成一次稀疏克隆
