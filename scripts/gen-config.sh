@@ -11,6 +11,8 @@ T=$(jq -r '.target // ""' ../config.json)    # 例 mediatek/filogic、x86/64
 P=$(jq -r '.profile // ""' ../config.json)   # 例 cmcc_rax3000m、generic
 : > /tmp/missing-packages
 : > /tmp/config-error
+: > /tmp/defconfig.log
+: > /tmp/gate-hints
 
 # target/profile 会被写进 .config，必须严格校验，防止注入额外的配置行
 if [ -n "$P" ]; then
@@ -24,7 +26,7 @@ rm -f .config
 if [ -n "$P" ]; then
   m="${T%%/*}"; s="${T##*/}"
   printf 'CONFIG_TARGET_%s=y\nCONFIG_TARGET_%s_%s=y\nCONFIG_TARGET_%s_%s_DEVICE_%s=y\n' "$m" "$m" "$s" "$m" "$s" "$P" > .config
-  make defconfig
+  make defconfig 2>&1 | tee -a /tmp/defconfig.log
   if ! grep -q "^CONFIG_TARGET_${m}_${s}_DEVICE_${P}=y" .config; then
     echo "机型 ${P} 在 ${T} 里不存在或没有生效。请回到模板页重新选择机型（源码版本可能改过机型名）。" | tee /tmp/config-error
     echo "::error::$(cat /tmp/config-error)"
@@ -47,7 +49,7 @@ fi
 
 # 追加所选插件，再让源码补全依赖
 jq -r '.packages[]? | select(test("^[A-Za-z0-9_.+-]+$")) | "CONFIG_PACKAGE_\(.)=y"' ../config.json >> .config
-make defconfig
+make defconfig 2>&1 | tee -a /tmp/defconfig.log
 
 for p in $(jq -r '.packages[]?' ../config.json); do
   grep -q "^CONFIG_PACKAGE_${p}=y" .config || echo "$p" >> /tmp/missing-packages
@@ -88,13 +90,33 @@ explain() {
   done
   return 0
 }
+# 打印 Kconfig 对这个包的真实判定：depends on / select 条件，以及条件里每个符号在 .config 里的当前值
+kconfig_info() {
+  local p="$1" l s v
+  awk -v s="config PACKAGE_$p" '{l=$0; sub(/^[ \t]+/,"",l)} l==s{f=1;next} f&&(l==""||l~/^config /){exit} f&&l~/^(depends on|select|visible if)/{print l}' tmp/.config-package.in 2>/dev/null | while read -r l; do
+    echo "    Kconfig：$l"
+    case "$l" in "depends on"*)
+      for s in $(echo "${l#depends on}" | sed -E 's/[()!&|<>=]+/ /g'); do
+        [[ "$s" =~ ^[A-Za-z][A-Za-z0-9_.+-]*$ ]] || continue
+        case "$s" in y|n|m) continue;; esac
+        v=$(sed -n "s/^CONFIG_${s}=//p" .config | head -n1 || true)
+        echo "        ${s} = ${v:-未设置(n)}"
+        # 条件里要求另一个包必须启用（例：ponwrt 要求 libdrm / ffmpeg 的相关选项需要 PACKAGE_video-support）
+        if [[ "$s" == PACKAGE_* ]] && { [ -z "$v" ] || [ "$v" = n ]; } && pkg_known "${s#PACKAGE_}"; then echo "${s#PACKAGE_}" >> /tmp/gate-hints; fi
+      done ;;
+    esac
+  done || true
+  grep -E "(^|[^A-Za-z0-9_-])(PACKAGE_)?${p}([^A-Za-z0-9_-]|$)" /tmp/defconfig.log 2>/dev/null | grep -iE "warn|error|unmet|override|invalid" | sort -u | head -n 5 | sed 's/^/    defconfig 输出：/' || true
+  grep -nE "CONFIG_PACKAGE_${p}( |=)" .config 2>/dev/null | sed 's/^/    .config 里：/' || true
+}
 diagnose() {
   local p d names out dirs
   for p in $(cat /tmp/missing-packages); do
     if pkg_known "$p"; then
       echo "- ${p}：已被识别，但 defconfig 后没有启用。"
       out=$(explain "$p" "    " 3)
-      if [ -n "$out" ]; then echo "$out"; else echo "    没有发现缺失的依赖或不满足的平台限制；可能是它依赖的某个包因 Kconfig 冲突被丢弃，或与已选包互斥（Conflicts）。"; fi
+      if [ -n "$out" ]; then echo "$out"; else echo "    没有发现缺失的依赖或不满足的平台限制，下面是 Kconfig 的原始判定，请对照："; fi
+      kconfig_info "$p"
     else
       dirs=$(find package -maxdepth 4 -type d -name "$p" -not -path 'package/feeds/*' 2>/dev/null | head -n3 || true)
       if [ -n "$dirs" ]; then
@@ -105,6 +127,23 @@ diagnose() {
       fi
     fi
   done
+  local gates still g
+  gates=$(sort -u /tmp/gate-hints 2>/dev/null | tr '\n' ' ')
+  if [ -n "${gates// /}" ]; then
+    cp .config /tmp/config.before-gate
+    # 被丢掉的包在 .config 里的那一行也一起没了，所以要连同它们再写一遍
+    for g in $gates $(cat /tmp/missing-packages); do echo "CONFIG_PACKAGE_${g}=y" >> .config; done
+    make defconfig > /dev/null 2>&1 || true
+    still=""
+    for p in $(cat /tmp/missing-packages); do grep -q "^CONFIG_PACKAGE_${p}=y" .config || still="$still $p"; done
+    cp /tmp/config.before-gate .config
+    if [ -z "$still" ]; then echo "- 已验证：在模板里额外加上这些包，缺失的插件就都能生效：${gates}（自定义插件的「额外需要的包」里填上，或在商店里一并勾选）"
+    else echo "- 额外启用 ${gates} 后，仍有没生效的：${still}"; fi
+  fi
+  if grep -q "unmet direct dependencies" /tmp/defconfig.log 2>/dev/null; then
+    echo "- defconfig 输出里的「依赖未满足」警告（最多 30 行）："
+    grep -A4 "unmet direct dependencies" /tmp/defconfig.log | head -n 30 | sed 's/^/    /' || true
+  fi
   jq -r '.plugins[]? | select(.git_url) | (if .sparse then (.dirs[] | split("/") | last) else .name end)' ../config.json | sort -u | while read -r d; do
     if [ ! -d "package/$d" ]; then echo "- 自定义插件目录 package/$d 不存在"; continue; fi
     names=$(grep -rhoE --include=Makefile "(call BuildPackage,[[:space:]]*[A-Za-z0-9_.+-]+|^PKG_NAME[[:space:]]*:?=[[:space:]]*[A-Za-z0-9_.+-]+)" "package/$d" 2>/dev/null | sed -E 's/^.*[,=][[:space:]]*//' | sort -u | tr '\n' ' ' || true)
