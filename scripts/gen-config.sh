@@ -53,13 +53,57 @@ for p in $(jq -r '.packages[]?' ../config.json); do
   grep -q "^CONFIG_PACKAGE_${p}=y" .config || echo "$p" >> /tmp/missing-packages
 done
 
-# 逐个说明没生效的原因：源码里有没有这个包、自定义插件仓库里实际定义了哪些包名
+# 逐个说明没生效的原因。以 OpenWrt 扫描出的 tmp/.packageinfo 为准：
+#   · 包没被扫描出来 → Makefile 有问题（给出扫描日志）或包名不对
+#   · 包被扫描出来了但没启用 → 顺着它的依赖往下查：哪个依赖在源码里不存在、哪个平台限制（@...）不满足
+PKGINFO=tmp/.packageinfo
+deps_of()    { awk -v p="$1" '$0=="Package: "p {f=1; next} f && /^Depends:/ {sub(/^Depends: */,""); print; exit} f && /^@@/ {exit}' "$PKGINFO"; }
+pkg_known()  { grep -qxF "Package: $1" "$PKGINFO" || grep -qE "^Provides:.*(^|[[:space:]])$1([[:space:]]|$)" "$PKGINFO"; }
+cfg_on()     { grep -qE "^CONFIG_$1=y" .config; }
+# 打印 $1 的依赖里有问题的部分（没有问题则不输出）；$2 缩进；$3 剩余深度
+explain() {
+  local p="$1" ind="$2" depth="$3" tok n c neg out
+  for tok in $(deps_of "$p"); do
+    case "$tok" in
+      @*)
+        c="${tok#@}"; neg=""; case "$c" in '!'*) neg=1; c="${c#!}";; esac
+        if [[ "$c" =~ ^[A-Za-z0-9_]+$ ]]; then
+          if { [ -z "$neg" ] && ! cfg_on "$c"; } || { [ -n "$neg" ] && cfg_on "$c"; }; then
+            echo "${ind}限制条件 ${tok} 不满足：这个包不支持当前平台或当前配置"
+          fi
+        else
+          echo "${ind}限制条件 ${tok}（较复杂，请对照 Makefile 的 DEPENDS 核对）"
+        fi ;;
+      *)
+        n="${tok#+}"
+        [[ "$n" =~ ^[A-Za-z0-9_.+-]+$ ]] || continue          # 带条件的写法（+FOO:bar）无法静态判断，跳过
+        case "$n" in libc|libgcc|libpthread|librt|libstdcpp|libatomic) continue;; esac
+        if ! pkg_known "$n"; then
+          echo "${ind}依赖 ${n}：源码和 feeds 里都没有这个包"
+        elif [ "$depth" -gt 0 ]; then
+          out=$(explain "$n" "${ind}    " $((depth - 1)))
+          [ -n "$out" ] && { echo "${ind}依赖 ${n} 本身有问题："; echo "$out"; }
+        fi ;;
+    esac
+  done
+  return 0
+}
 diagnose() {
-  local p f d names
+  local p d names out dirs
   for p in $(cat /tmp/missing-packages); do
-    f=$(grep -rlsE --include=Makefile "call BuildPackage,[[:space:]]*${p}[)[:space:]]|^PKG_NAME[[:space:]]*:?=[[:space:]]*${p}[[:space:]]*$" package feeds 2>/dev/null | head -n1 || true)
-    if [ -n "$f" ]; then echo "- ${p}：在 ${f} 里有定义，但没被启用（依赖没满足，或不支持当前平台）"
-    else echo "- ${p}：源码和 feeds 里都没有叫这个名字的包（包名要和 Makefile 里的 PKG_NAME 一致，不是目录名）"; fi
+    if pkg_known "$p"; then
+      echo "- ${p}：已被识别，但 defconfig 后没有启用。"
+      out=$(explain "$p" "    " 3)
+      if [ -n "$out" ]; then echo "$out"; else echo "    没有发现缺失的依赖或不满足的平台限制；可能是它依赖的某个包因 Kconfig 冲突被丢弃，或与已选包互斥（Conflicts）。"; fi
+    else
+      dirs=$(find package -maxdepth 4 -type d -name "$p" -not -path 'package/feeds/*' 2>/dev/null | head -n3 || true)
+      if [ -n "$dirs" ]; then
+        echo "- ${p}：目录 $(echo $dirs | tr '\n' ' ')存在，但 OpenWrt 没有扫描出这个包，通常是 Makefile 有错误。"
+        for d in $dirs; do [ -s "logs/$d/dump.txt" ] && { echo "    扫描日志 logs/$d/dump.txt 末尾："; tail -n 6 "logs/$d/dump.txt" | sed 's/^/      /'; }; done
+      else
+        echo "- ${p}：源码和 feeds 里都没有叫这个名字的包（包名要和 Makefile 里的 PKG_NAME / BuildPackage 一致，不是目录名）"
+      fi
+    fi
   done
   jq -r '.plugins[]? | select(.git_url) | (if .sparse then (.dirs[] | split("/") | last) else .name end)' ../config.json | sort -u | while read -r d; do
     if [ ! -d "package/$d" ]; then echo "- 自定义插件目录 package/$d 不存在"; continue; fi
