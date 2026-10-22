@@ -85,23 +85,12 @@
    "repo_url": "https://github.com/immortalwrt/immortalwrt",
    "branch": "openwrt-24.10"
   },
-  {
-   "id": "immortalwrt-23.05",
-   "name": "ImmortalWrt",
-   "repo_url": "https://github.com/immortalwrt/immortalwrt",
-   "branch": "openwrt-23.05"
-  },
+ 
   {
    "id": "immortalwrt-master",
    "name": "ImmortalWrt",
    "repo_url": "https://github.com/immortalwrt/immortalwrt",
    "branch": "master"
-  },
-  {
-   "id": "openwrt-24.10",
-   "name": "OpenWrt 官方",
-   "repo_url": "https://github.com/openwrt/openwrt",
-   "branch": "openwrt-24.10"
   },
   {
    "id": "lede-master",
