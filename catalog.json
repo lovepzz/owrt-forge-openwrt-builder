@@ -2,9 +2,9 @@
  "schema": 1,
  "updated": "2026-10-22",
  "upstream": {
-  "repo": "https://github.com/immortalwrt/luci",
-  "branch": "openwrt-24.10",
-  "commit": "7f9ad99d611a7548125e73b7e375b6d1793ca1ef"
+  "repo": "https://github.com/kiddin9/op-packages",
+  "branch": "main",
+ 
  },
  "categories": [
   {
