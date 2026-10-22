@@ -79,14 +79,7 @@
   }
  ],
  "sources": [
-  {
-   "id": "immortalwrt-24.10",
-   "name": "ImmortalWrt",
-   "repo_url": "https://github.com/immortalwrt/immortalwrt",
-   "branch": "openwrt-24.10"
-  },
- 
-  {
+ {
    "id": "immortalwrt-master",
    "name": "ImmortalWrt",
    "repo_url": "https://github.com/immortalwrt/immortalwrt",
