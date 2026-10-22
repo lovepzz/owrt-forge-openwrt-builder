@@ -1,8 +1,8 @@
 {
   "_doc": "手工维护区：这里的改动会在每次同步后保留。字段说明见 CATALOG.md",
   "upstream": {
-    "repo": "https://github.com/immortalwrt/luci",
-    "branch": "openwrt-24.10",
+    "repo": "https://github.com/kiddin9/op-packages",
+    "branch": "main",
     "dirs": {
       "applications": "app",
       "themes": "theme",
