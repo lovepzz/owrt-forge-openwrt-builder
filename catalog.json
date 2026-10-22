@@ -80,13 +80,13 @@
  ],
  "sources": [
  {
-   "id": "immortalwrt-master",
+   "id": "immortalwrt♥默认分支",
    "name": "ImmortalWrt",
    "repo_url": "https://github.com/immortalwrt/immortalwrt",
    "branch": "master"
   },
   {
-   "id": "lede-master",
+   "id": "lede♥默认分支",
    "name": "LEDE",
    "repo_url": "https://github.com/coolsnowwolf/lede",
    "branch": "master"
